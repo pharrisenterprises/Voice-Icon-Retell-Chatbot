@@ -7,6 +7,5 @@ import { redirect } from 'next/navigation';
  */
 export default function Home() {
   redirect('/embed');
-  // Returning null is fine; redirect already ends the response.
   return null;
 }
