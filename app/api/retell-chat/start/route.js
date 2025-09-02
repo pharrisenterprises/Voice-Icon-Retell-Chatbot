@@ -1,21 +1,15 @@
 // app/api/retell-chat/start/route.js
 export async function GET(req) {
-  const headers = corsHeaders(req);
-  try {
-    // Your backend may want to create a server-side session.
-    // For now, generate a random chatId so the frontend can group messages.
-    const chatId = 'chat_' + Math.random().toString(36).slice(2);
-    return new Response(JSON.stringify({ ok: true, chatId }), { status: 200, headers });
-  } catch (e) {
-    return new Response(JSON.stringify({ ok: false, error: 'failed_to_start' }), { status: 500, headers });
-  }
+  const headers = cors(req);
+  const chatId = 'chat_' + Math.random().toString(36).slice(2);
+  return new Response(JSON.stringify({ ok: true, chatId }), { status: 200, headers });
 }
 
 export function OPTIONS(req) {
-  return new Response(null, { status: 204, headers: corsHeaders(req) });
+  return new Response(null, { status: 204, headers: cors(req) });
 }
 
-function corsHeaders(req) {
+function cors(req) {
   const origin = req.headers.get('origin') || '*';
   return {
     'Access-Control-Allow-Origin': origin,
