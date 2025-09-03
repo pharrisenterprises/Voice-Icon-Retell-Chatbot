@@ -1,21 +1,27 @@
 'use client';
-export const dynamic = 'force-dynamic'; // make this page dynamic so it won't be prerendered
+export const dynamic = 'force-dynamic';
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import createRetellRealtime from '../lib/retellRealtime';
 
-const FETCH_JSON = async (url, opts = {}) => {
-  const res = await fetch(url, {
-    ...opts,
-    headers: { 'Content-Type': 'application/json', ...(opts.headers || {}) },
-    credentials: 'include',
+const GET = async (url) => {
+  const r = await fetch(url, { cache: 'no-store' });
+  if (!r.ok) throw new Error(`GET ${url} -> ${r.status}`);
+  return r.json();
+};
+const POST = async (url, body) => {
+  const r = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body || {}),
   });
-  if (!res.ok) throw new Error(`HTTP ${res.status}`);
-  return res.json();
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(j?.error || `POST ${url} -> ${r.status}`);
+  return j;
 };
 
 export default function EmbedPage() {
-  // Read ?autostart=1 without useSearchParams (prevents build error)
+  // read ?autostart=1 without useSearchParams (avoids prerender error)
   const [autostart, setAutostart] = useState(false);
   useEffect(() => {
     try {
@@ -25,14 +31,21 @@ export default function EmbedPage() {
   }, []);
 
   const [chatId, setChatId] = useState(null);
-  const [connecting, setConnecting] = useState(false);
   const [micOn, setMicOn] = useState(true);
   const [muted, setMuted] = useState(false);
-  const [status, setStatus] = useState('idle');
   const [needsAudioUnlock, setNeedsAudioUnlock] = useState(false);
   const [messages, setMessages] = useState([
     { role: 'assistant', text: "Hi! I'm ready. You can speak, or type below." },
   ]);
+
+  // CALMER STATUS: only four states we surface to the user
+  // 'idle' | 'ready' | 'speaking' | 'error'
+  const [status, setStatus] = useState('idle');
+  const setStatusCalm = useCallback((s) => {
+    // collapse noisy transitions
+    if (s === 'connecting') s = micOn ? 'ready' : 'idle';
+    setStatus(s);
+  }, [micOn]);
 
   const inputRef = useRef(null);
   const scrollerRef = useRef(null);
@@ -42,12 +55,11 @@ export default function EmbedPage() {
 
   const scrollToBottom = useCallback(() => {
     const el = scrollerRef.current;
-    if (!el) return;
-    el.scrollTo({ top: el.scrollHeight + 9999, behavior: 'smooth' });
+    if (el) el.scrollTop = el.scrollHeight + 9999;
   }, []);
   useEffect(() => { scrollToBottom(); }, [messages, scrollToBottom]);
 
-  // Audio unlock (autoplay/iOS)
+  // Audio unlock probe
   useEffect(() => {
     try {
       if (!audioCtxRef.current) {
@@ -58,10 +70,10 @@ export default function EmbedPage() {
   }, []);
 
   const pushMsg = useCallback((role, text) => {
-    setMessages(prev => [...prev, { role, text }]);
+    setMessages((m) => [...m, { role, text }]);
   }, []);
   const replaceAssistantLiveLine = useCallback((text) => {
-    setMessages(prev => {
+    setMessages((prev) => {
       const last = prev[prev.length - 1];
       if (last && last.role === 'assistant_stream') {
         const next = prev.slice(0, -1);
@@ -72,7 +84,7 @@ export default function EmbedPage() {
     });
   }, []);
   const promoteAssistantLiveLine = useCallback(() => {
-    setMessages(prev => {
+    setMessages((prev) => {
       const last = prev[prev.length - 1];
       if (last && last.role === 'assistant_stream') {
         const next = prev.slice(0, -1);
@@ -83,6 +95,7 @@ export default function EmbedPage() {
     });
   }, []);
 
+  // Agent partial/final text (used by realtime or when we TTS)
   const handleAgentText = useCallback((txt, isFinal) => {
     if (!txt) return;
     if (isFinal) {
@@ -93,32 +106,34 @@ export default function EmbedPage() {
     }
   }, [replaceAssistantLiveLine, promoteAssistantLiveLine]);
 
-  const handleUserTextFromMic = useCallback(async (userFinalText) => {
-    if (!userFinalText || !userFinalText.trim()) return;
-    pushMsg('user', userFinalText.trim());
-    scrollToBottom();
+  // From fallback ASR when user finishes a phrase
+  const handleUserTextFromMic = useCallback(async (finalText) => {
+    if (!finalText || !finalText.trim()) return;
+    const content = finalText.trim();
+    pushMsg('user', content);
     try {
-      const data = await FETCH_JSON('/api/retell-chat/send', {
-        method: 'POST',
-        body: JSON.stringify({ chatId, content: userFinalText.trim() }),
-      });
-      const reply = (data && data.reply) || '';
+      const data = await POST('/api/retell-chat/send', { chatId, content });
+      const reply = data?.reply || '';
       if (reply) {
-        await rtRef.current.speakText(reply);
+        await rtRef.current?.speakText(reply);
         pushMsg('assistant', reply);
+      } else {
+        pushMsg('assistant', 'No reply from agent.');
       }
-    } catch {
-      pushMsg('assistant', 'Sorry—there was a problem sending that.');
+    } catch (e) {
+      pushMsg('assistant', `There was a problem talking to the agent: ${e.message || e}`);
+      setStatusCalm('error');
     }
-  }, [chatId, pushMsg, scrollToBottom]);
+  }, [chatId, pushMsg, setStatusCalm]);
 
+  // Visualizer amp
   const handleAudioBuffer = useCallback((amp) => {
-    visualAmpRef.current = Math.max(0, Math.min(1, amp || 0));
+    // smooth to avoid flicker
+    const prev = visualAmpRef.current;
+    visualAmpRef.current = prev * 0.7 + (Math.max(0, Math.min(1, amp || 0))) * 0.3;
   }, []);
-  const updateStatus = useCallback((s) => setStatus(s), []);
 
   const connectHelper = useCallback(async (newChatId) => {
-    setConnecting(true);
     if (!audioCtxRef.current) {
       try { audioCtxRef.current = new (window.AudioContext || window.webkitAudioContext)(); } catch {}
     }
@@ -127,67 +142,75 @@ export default function EmbedPage() {
     await helper.connect({
       onAgentText: handleAgentText,
       onAudioBuffer: handleAudioBuffer,
-      onStatus: updateStatus,
+      onStatus: setStatusCalm,      // calm version
       onUserText: handleUserTextFromMic,
       getChatId: () => newChatId,
       getMuted: () => muted,
     });
-    setConnecting(false);
+    // Only start mic if switch is ON
     if (micOn) {
       try {
         await helper.startMic();
-      } catch {
-        setStatus('error');
-        pushMsg('assistant', 'Mic permissions were blocked. You can still type below.');
+        setStatusCalm('ready');
+      } catch (e) {
+        pushMsg('assistant', 'Mic permission was blocked. You can still type below.');
         setMicOn(false);
+        setStatusCalm('idle');
         setTimeout(() => inputRef.current?.focus(), 50);
       }
     }
-  }, [handleAgentText, handleAudioBuffer, handleUserTextFromMic, micOn, muted, updateStatus, pushMsg]);
+  }, [handleAgentText, handleAudioBuffer, handleUserTextFromMic, micOn, muted, setStatusCalm, pushMsg]);
 
   const startNewChat = useCallback(async () => {
     try {
-      const data = await FETCH_JSON('/api/retell-chat/start');
+      const data = await GET('/api/retell-chat/start');
       if (data?.ok && data.chatId) {
         setChatId(data.chatId);
         await connectHelper(data.chatId);
       } else {
-        throw new Error('no chatId');
+        throw new Error('No chatId from /start');
       }
-    } catch {
-      setStatus('error');
-      pushMsg('assistant', 'Could not start a new chat. Please try again.');
+    } catch (e) {
+      setStatusCalm('error');
+      pushMsg('assistant', `Could not start a new chat. ${e.message || e}`);
     }
-  }, [connectHelper, pushMsg]);
+  }, [connectHelper, pushMsg, setStatusCalm]);
 
+  // autostart
   useEffect(() => {
-    let cancelled = false;
-    (async () => { if (autostart) await startNewChat(); if (cancelled) return; })();
-    return () => { cancelled = true; rtRef.current?.disconnect(); };
+    let alive = true;
+    (async () => { if (autostart) await startNewChat(); if (!alive) return; })();
+    return () => { alive = false; rtRef.current?.disconnect(); };
   }, [autostart, startNewChat]);
 
-  const [vizTick, setVizTick] = useState(0);
-  useEffect(() => {
-    let raf; const loop = () => { setVizTick(t => (t + 1) % 1000000); raf = requestAnimationFrame(loop); };
-    raf = requestAnimationFrame(loop); return () => cancelAnimationFrame(raf);
-  }, []);
+  // UI actions
   const onToggleMic = useCallback(async () => {
     if (!rtRef.current) return;
     if (micOn) {
-      await rtRef.current.stopMic(); setMicOn(false); setTimeout(() => inputRef.current?.focus(), 30);
+      await rtRef.current.stopMic();
+      setMicOn(false);
+      setStatusCalm('idle');
+      setTimeout(() => inputRef.current?.focus(), 30);
     } else {
-      try { await rtRef.current.startMic(); setMicOn(true); }
-      catch { setStatus('error'); pushMsg('assistant', 'Mic permission denied. You can still type below.'); }
+      try {
+        await rtRef.current.startMic();
+        setMicOn(true);
+        setStatusCalm('ready');
+      } catch {
+        pushMsg('assistant', 'Mic permission denied. You can still type below.');
+        setStatusCalm('idle');
+      }
     }
-  }, [micOn, pushMsg]);
-  const onToggleMute = useCallback(() => setMuted(m => !m), []);
+  }, [micOn, pushMsg, setStatusCalm]);
+
+  const onToggleMute = useCallback(() => setMuted((m) => !m), []);
   const onRestart = useCallback(async () => {
     rtRef.current?.disconnect();
-    setMessages([]);
-    pushMsg('assistant', 'Starting a fresh conversation...');
-    setStatus('connecting');
+    setMessages([{ role: 'assistant', text: 'Starting a fresh conversation…' }]);
+    setStatusCalm('idle');
     await startNewChat();
-  }, [pushMsg, startNewChat]);
+  }, [setStatusCalm, startNewChat]);
+
   const onSubmit = useCallback(async (e) => {
     e.preventDefault();
     const v = inputRef.current?.value || '';
@@ -195,37 +218,52 @@ export default function EmbedPage() {
     inputRef.current.value = '';
     pushMsg('user', v.trim());
     try {
-      const data = await FETCH_JSON('/api/retell-chat/send', {
-        method: 'POST',
-        body: JSON.stringify({ chatId, content: v.trim() }),
-      });
+      const data = await POST('/api/retell-chat/send', { chatId, content: v.trim() });
       const reply = data?.reply || '';
       if (reply) {
         await rtRef.current?.speakText(reply);
         pushMsg('assistant', reply);
+      } else {
+        pushMsg('assistant', 'No reply from agent.');
       }
-    } catch { pushMsg('assistant', 'Sorry—there was a problem sending that.'); }
-  }, [chatId, pushMsg]);
+    } catch (e2) {
+      pushMsg('assistant', `There was a problem talking to the agent: ${e2.message || e2}`);
+      setStatusCalm('error');
+    }
+  }, [chatId, pushMsg, setStatusCalm]);
 
   const onUnlockAudio = useCallback(async () => {
     try {
       if (audioCtxRef.current && audioCtxRef.current.state === 'suspended') {
         await audioCtxRef.current.resume();
       }
-      try { const u = new SpeechSynthesisUtterance(' '); u.volume = 0; window.speechSynthesis.speak(u); } catch {}
+      // kick TTS once
+      try {
+        const u = new SpeechSynthesisUtterance(' ');
+        u.volume = 0;
+        window.speechSynthesis.speak(u);
+      } catch {}
       setNeedsAudioUnlock(false);
     } catch {}
   }, []);
 
+  // visualizer bars
+  const [tick, setTick] = useState(0);
+  useEffect(() => {
+    let raf;
+    const loop = () => { setTick((t) => (t + 1) % 1000000); raf = requestAnimationFrame(loop); };
+    raf = requestAnimationFrame(loop);
+    return () => cancelAnimationFrame(raf);
+  }, []);
   const amp = visualAmpRef.current;
   const barHeights = useMemo(() => {
     const base = [0.3, 0.6, 0.9, 0.6, 0.3];
     return base.map((b, i) => {
-      const j = (Math.sin((vizTick + i * 13) / 7) + 1) / 2 * 0.12;
-      const h = (amp > 0 ? Math.max(amp, 0.2) : 0) * b + j;
+      const wiggle = (Math.sin((tick + i * 13) / 7) + 1) / 2 * 0.08;
+      const h = (amp > 0 ? Math.max(amp, 0.2) : 0) * b + wiggle;
       return Math.max(0.06, Math.min(1, h));
     });
-  }, [amp, vizTick]);
+  }, [amp, tick]);
 
   return (
     <div className="wrap">
@@ -242,13 +280,11 @@ export default function EmbedPage() {
           {barHeights.map((h, idx) => (<span key={idx} style={{ height: `${Math.round(h * 100)}%` }} />))}
         </div>
         <div className="statusline">
-          <span className="dot" data-state={status} />
           <span className="text">
-            {status === 'connecting' && 'Connecting…'}
             {status === 'ready' && (micOn ? 'Listening' : 'Mic off')}
             {status === 'speaking' && 'Speaking'}
-            {status === 'idle' && 'Ready'}
-            {status === 'error' && 'Error'}
+            {status === 'idle' && (micOn ? 'Ready' : 'Mic off')}
+            {status === 'error' && 'Error – check agent API'}
           </span>
         </div>
 
@@ -286,13 +322,8 @@ export default function EmbedPage() {
         .top { position:relative; padding:16px; display:grid; grid-template-rows:auto auto auto; gap:12px; }
         .visualizer { height:120px; background:radial-gradient(ellipse at center, rgba(255,255,255,.06), rgba(255,255,255,.02)); border-radius:12px;
                       display:grid; grid-template-columns:repeat(5,1fr); align-items:end; gap:8px; padding:10px; overflow:hidden; }
-        .visualizer span { display:block; width:100%; background:linear-gradient(180deg,#7aa2ff,#2a6df1); border-radius:6px 6px 0 0; transition:height 90ms ease; }
-        .statusline { display:inline-flex; align-items:center; gap:10px; opacity:.85; font-size:12px; }
-        .statusline .dot { width:8px; height:8px; border-radius:50%; background:#5b6b82; }
-        .statusline .dot[data-state="connecting"]{ background:#f1c40f; }
-        .statusline .dot[data-state="ready"]{ background:#30d158; }
-        .statusline .dot[data-state="speaking"]{ background:#2a6df1; }
-        .statusline .dot[data-state="error"]{ background:#ff453a; }
+        .visualizer span { display:block; width:100%; background:linear-gradient(180deg,#7aa2ff,#2a6df1); border-radius:6px 6px 0 0; transition:height 120ms ease; }
+        .statusline { font-size:12px; opacity:.85; }
         .controls { display:inline-flex; gap:8px; }
         .btn { background:rgba(255,255,255,.06); color:#e6e8ee; border:1px solid rgba(255,255,255,.1); padding:8px 10px; border-radius:10px; cursor:pointer; font-size:13px; }
         .btn.on { background:rgba(42,109,241,.2); border-color:rgba(42,109,241,.4); }
