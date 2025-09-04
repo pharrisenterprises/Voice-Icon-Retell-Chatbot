@@ -1,28 +1,21 @@
 // app/api/retell-chat/send/route.js
-// Calls Retell *text chat* agent and returns { ok, reply }.
-// Robust: tries multiple known endpoints until one succeeds.
+// Sends a user message to Retell (text chat) and returns the agent's reply.
+// Uses new endpoints: POST /create-chat-completion  (v1 is deprecated)
 
 export const dynamic = 'force-dynamic';
 
 const API_KEY = process.env.RETELL_API_KEY;
 const AGENT_ID = process.env.RETELL_CHAT_AGENT_ID;
-
-// If you know your exact URL, set RETELL_CHAT_API_URL in Vercel and we'll use it.
-// Otherwise we'll try a list of common paths automatically.
-const CANDIDATE_URLS = [
-  process.env.RETELL_CHAT_API_URL,                   // optional override
-  'https://api.retell.ai/v1/chat/completions',
-  'https://api.retellai.com/v1/chat/completions',
-  'https://api.retell.ai/v2/chat/completions',
-  'https://api.retellai.com/v2/chat/completions',
-].filter(Boolean);
+// Optional override if Retell gives you a specific base URL.
+const BASE = (process.env.RETELL_BASE_URL || '').replace(/\/+$/, '');
+const CANDIDATE_BASES = [BASE, 'https://api.retell.ai', 'https://api.retellai.com'].filter(Boolean);
 
 export async function POST(req) {
   const headers = cors(req);
 
   if (!API_KEY || !AGENT_ID) {
     return json(
-      { ok: false, error: 'missing_env', details: 'RETELL_API_KEY and RETELL_CHAT_AGENT_ID must be set on the widget project.' },
+      { ok: false, error: 'missing_env', details: 'RETELL_API_KEY and RETELL_CHAT_AGENT_ID must be set.' },
       500,
       headers
     );
@@ -30,80 +23,103 @@ export async function POST(req) {
 
   let body = {};
   try { body = await req.json(); } catch {}
-  const { chatId, content } = body || {};
+  let { chatId, content } = body || {};
   if (!content || typeof content !== 'string') {
     return json({ ok: false, error: 'no_content' }, 400, headers);
   }
 
-  // Common payload for Retell chat APIs.
-  const payload = {
-    agent_id: AGENT_ID,
-    messages: [{ role: 'user', content }],
-    // Some APIs accept chat_id / conversation id; harmless if ignored.
-    chat_id: chatId || undefined,
-    stream: false,
-  };
+  // If no chatId was provided, create one now (binds to the agent).
+  if (!chatId) {
+    const created = await createChat();
+    if (!created?.chatId) {
+      return json(
+        { ok: false, error: 'cannot_create_chat', details: created?.error || created },
+        502,
+        headers
+      );
+    }
+    chatId = created.chatId;
+  }
 
-  const lastErrors = [];
-  for (const url of CANDIDATE_URLS) {
+  const payload = { chat_id: chatId, content };
+  const last = [];
+
+  for (const b of CANDIDATE_BASES) {
     try {
-      const controller = new AbortController();
-      const t = setTimeout(() => controller.abort(), 20000);
-
-      const res = await fetch(url, {
+      const res = await fetch(`${b}/create-chat-completion`, {
         method: 'POST',
         headers: {
           'Authorization': `Bearer ${API_KEY}`,
           'Content-Type': 'application/json',
         },
         body: JSON.stringify(payload),
-        signal: controller.signal,
-      }).catch((e) => {
-        throw new Error(`network_error: ${String(e?.message || e)}`);
       });
-      clearTimeout(t);
-
       const text = await res.text();
-      let data; try { data = JSON.parse(text); } catch { data = null; }
+      let data; try { data = JSON.parse(text); } catch {}
 
       if (!res.ok) {
-        lastErrors.push({ url, status: res.status, body: data || text || null });
-        continue; // try next candidate
+        last.push({ base: b, status: res.status, body: data || text || null });
+        continue;
       }
 
-      // Extract a reply from common shapes:
-      const reply =
-        (data && (data.reply || data.message || data.output || data.text)) ??
-        (data && data.choices && data.choices[0]?.message?.content) ??
-        (Array.isArray(data?.messages) && data.messages.find(m => m.role === 'assistant')?.content) ??
-        '';
+      // Docs show the reply is in `messages` (role: 'agent').
+      const messages = data?.messages;
+      const assistant = Array.isArray(messages)
+        ? [...messages].reverse().find(m => (m?.role === 'agent' || m?.role === 'assistant') && typeof m?.content === 'string')
+        : null;
+      const reply = assistant?.content || '';
 
       if (!reply) {
-        lastErrors.push({ url, status: res.status, body: data || text || null, reason: 'empty_reply' });
-        continue; // try next candidate
+        last.push({ base: b, status: res.status, body: data || text || null, reason: 'empty_reply' });
+        continue;
       }
 
-      // Success 🎉
       return json({ ok: true, reply, chatId }, 200, headers);
-    } catch (err) {
-      lastErrors.push({ url, error: String(err?.message || err) });
-      // continue to next url
+    } catch (e) {
+      last.push({ base: b, error: String(e?.message || e) });
     }
   }
 
-  // No candidate worked
-  return json(
-    { ok: false, error: 'retell_error', tried: CANDIDATE_URLS, details: lastErrors.slice(-1)[0] || lastErrors[0] || null },
-    502,
-    headers
-  );
+  return json({ ok: false, error: 'retell_error', tried: CANDIDATE_BASES, details: last.slice(-1)[0] || null }, 502, headers);
 }
 
 export function OPTIONS(req) {
   return new Response(null, { status: 204, headers: cors(req) });
 }
 
-/* ---------------- utils ---------------- */
+/* -------- helpers & utils -------- */
+async function createChat() {
+  if (!API_KEY || !AGENT_ID) return { error: 'missing_env' };
+  const BASE = (process.env.RETELL_BASE_URL || '').replace(/\/+$/, '');
+  const bases = [BASE, 'https://api.retell.ai', 'https://api.retellai.com'].filter(Boolean);
+  const payload = { agent_id: AGENT_ID };
+  const last = [];
+
+  for (const b of bases) {
+    try {
+      const res = await fetch(`${b}/create-chat`, {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${API_KEY}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(payload),
+      });
+      const text = await res.text();
+      let data; try { data = JSON.parse(text); } catch {}
+      if (!res.ok) {
+        last.push({ base: b, status: res.status, body: data || text || null });
+        continue;
+      }
+      const chatId = data?.chat_id;
+      if (chatId) return { chatId };
+      last.push({ base: b, status: res.status, body: data || text || null, reason: 'no_chat_id' });
+    } catch (e) {
+      last.push({ base: b, error: String(e?.message || e) });
+    }
+  }
+  return { error: { tried: bases, details: last.slice(-1)[0] || null } };
+}
 
 function json(obj, status, headers) {
   return new Response(JSON.stringify(obj), {
@@ -111,7 +127,6 @@ function json(obj, status, headers) {
     headers: { 'Content-Type': 'application/json', ...(headers || {}) },
   });
 }
-
 function cors(req) {
   const origin = req.headers.get('origin') || '*';
   return {
