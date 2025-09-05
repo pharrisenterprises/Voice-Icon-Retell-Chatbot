@@ -2,18 +2,18 @@
 
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 
-/* ===== Neon OUTPUT visualizer (never routes mic → no echo) ===== */
+/* ---------- Neon output visualizer (never routes mic → no echo) ---------- */
 function Visualizer({ analyser }) {
   const canvasRef = useRef(null);
   useEffect(() => {
-    const canvas = canvasRef.current;
-    if (!canvas) return;
-    const ctx = canvas.getContext('2d');
+    const cvs = canvasRef.current;
+    if (!cvs) return;
+    const ctx = cvs.getContext('2d');
     const BARS = 42;
-    const buf = new Uint8Array(1024);
+    const fft = new Uint8Array(1024);
     let raf = 0;
 
-    function bar(x, y, w, h, glow) {
+    function paintBar(x, y, w, h, glow) {
       const g = ctx.createLinearGradient(0, y - h, 0, y);
       g.addColorStop(0, '#7DD3FC');
       g.addColorStop(1, '#60A5FA');
@@ -25,28 +25,27 @@ function Visualizer({ analyser }) {
     }
 
     function idle() {
-      ctx.clearRect(0, 0, canvas.width, canvas.height);
-      const w = canvas.width / BARS;
+      ctx.clearRect(0, 0, cvs.width, cvs.height);
+      const w = cvs.width / BARS;
       for (let i = 0; i < BARS; i++) {
         const h = 6 + 4 * Math.sin((Date.now() / 320) + i * 0.55);
-        bar(i * w + w * 0.25, canvas.height, w * 0.5, h, 0.35);
+        paintBar(i * w + w * 0.25, cvs.height, w * 0.5, h, 0.35);
       }
     }
 
     function loop() {
       raf = requestAnimationFrame(loop);
       if (!analyser) return idle();
-      analyser.getByteFrequencyData(buf);
-      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      analyser.getByteFrequencyData(fft);
+      ctx.clearRect(0, 0, cvs.width, cvs.height);
       const step = Math.max(1, Math.floor(analyser.frequencyBinCount / BARS));
-      const w = canvas.width / BARS;
+      const w = cvs.width / BARS;
       for (let i = 0; i < BARS; i++) {
-        const v = buf[i * step] / 255;
-        const h = Math.max(6, v * canvas.height * 0.9);
-        bar(i * w + w * 0.25, canvas.height, w * 0.5, h, 0.7 + v * 0.7);
+        const v = fft[i * step] / 255;
+        const h = Math.max(6, v * cvs.height * 0.9);
+        paintBar(i * w + w * 0.25, cvs.height, w * 0.5, h, 0.7 + v * 0.7);
       }
     }
-
     loop();
     return () => cancelAnimationFrame(raf);
   }, [analyser]);
@@ -54,18 +53,16 @@ function Visualizer({ analyser }) {
   return <canvas ref={canvasRef} width={1400} height={260} style={{ width: '100%', height: '100%' }} aria-hidden="true" />;
 }
 
-/* ========================= Voice embed page ========================= */
+/* ============================ Voice-only widget ============================ */
 export default function EmbedPage() {
-  // Status
-  const [status, setStatus] = useState('ready'); // ready | listening | speaking | error
+  /* ---- UI state ---- */
+  const [status, setStatus] = useState('mic-off'); // mic-off | listening | speaking | error
   const [statusNote, setStatusNote] = useState('');
-
-  // Toggles
   const [muted, setMuted] = useState(false);
   const [micOn, setMicOn] = useState(false);
   const [needsAudioUnlock, setNeedsAudioUnlock] = useState(false);
 
-  // Chat
+  /* ---- Chat state ---- */
   const [chatId, setChatId] = useState(null);
   const [messages, setMessages] = useState([
     { role: 'assistant', content: "G'day! I'm Otto 👋  Type below or tap the mic to talk." },
@@ -74,29 +71,43 @@ export default function EmbedPage() {
   const endRef = useRef(null);
   useEffect(() => { endRef.current?.scrollIntoView({ behavior: 'smooth' }); }, [messages.length]);
 
-  // Audio OUT chain
+  /* ---- Audio OUT (no loopback) ---- */
   const audioCtxRef = useRef(null);
   const gainRef = useRef(null);
   const analyserRef = useRef(null);
   const ttsSourceRef = useRef(null);
 
-  // Mic / ASR
+  /* ---- Speech in/out runtime ---- */
   const micStreamRef = useRef(null);
   const recognitionRef = useRef(null);
-  const reconnTimerRef = useRef(null);
+  const recActiveRef = useRef(false);
+  const recRestartAttemptsRef = useRef(0);
+  const recIdleTimerRef = useRef(null);
 
-  // Echo guard while speaking
   const speakingRef = useRef(false);
   const speakGuardUntilRef = useRef(0);
 
-  // For replay on unmute
   const lastAssistantRef = useRef({ text: '', ts: 0 });
 
-  // Inactivity window (from last activity)
-  const INACTIVITY_MS = 45000;
+  // True inactivity (no user speech and no Otto speech)
+  const INACTIVITY_MS = 3 * 60 * 1000; // 3 minutes
   const lastActivityRef = useRef(Date.now());
 
-  /* -------------------- audio graph -------------------- */
+  // Watchdog to auto-stop mic after long inactivity
+  useEffect(() => {
+    if (!micOn) return;
+    const iv = setInterval(() => {
+      if (!micOn) return;
+      if (speakingRef.current) { lastActivityRef.current = Date.now(); return; }
+      const idle = Date.now() - lastActivityRef.current;
+      if (idle >= INACTIVITY_MS) {
+        stopMic('Mic auto-stopped due to inactivity. Toggle Mic on to speak.');
+      }
+    }, 1000);
+    return () => clearInterval(iv);
+  }, [micOn]);
+
+  /* ------------------ Build audio graph ------------------ */
   const ensureAudioGraph = useCallback(async () => {
     if (!audioCtxRef.current) {
       const Ctx = window.AudioContext || window.webkitAudioContext;
@@ -120,7 +131,7 @@ export default function EmbedPage() {
     }
   }, [muted]);
 
-  /* -------------------- start chat -------------------- */
+  /* ------------------ Server chat routes ------------------ */
   const startChat = useCallback(async () => {
     try {
       const r = await fetch('/api/retell-chat/start', { cache: 'no-store' });
@@ -131,28 +142,27 @@ export default function EmbedPage() {
     return null;
   }, []);
 
-  /* -------------------- send text -------------------- */
   const sendToAgent = useCallback(async (text) => {
     const cid = chatId || (await startChat());
     if (!cid) return;
     lastActivityRef.current = Date.now();
-
     try {
       const r = await fetch('/api/retell-chat/send', {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ chatId: cid, content: text }),
       });
       const j = await r.json();
       if (j?.ok && j?.reply) {
         lastAssistantRef.current = { text: j.reply, ts: Date.now() };
         lastActivityRef.current = Date.now();
-        setMessages((m) => [...m, { role: 'assistant', content: j.reply }]);
+        setMessages(m => [...m, { role: 'assistant', content: j.reply }]);
         if (!muted) await speak(j.reply);
       } else {
-        setMessages((m) => [...m, { role: 'assistant', content: 'I had trouble reaching the agent just now.' }]);
+        setMessages(m => [...m, { role: 'assistant', content: 'I had trouble reaching the agent just now.' }]);
       }
     } catch {
-      setMessages((m) => [...m, { role: 'assistant', content: 'Network hiccup—try again.' }]);
+      setMessages(m => [...m, { role: 'assistant', content: 'Network hiccup—try again.' }]);
     }
   }, [chatId, startChat, muted]);
 
@@ -161,14 +171,16 @@ export default function EmbedPage() {
     if (!text) return;
 
     speakingRef.current = true;
-    speakGuardUntilRef.current = Date.now() + 2000;
+    speakGuardUntilRef.current = Date.now() + 2000; // ignore recognition near TTS start
 
     try { ttsSourceRef.current?.stop?.(0); } catch {}
 
+    // Azure (Edge, Chrome, etc.)
     try {
       await ensureAudioGraph();
       const res = await fetch('/api/tts/speak', {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ text }),
       });
       if (res.ok && res.headers.get('Content-Type')?.includes('audio/')) {
@@ -185,7 +197,9 @@ export default function EmbedPage() {
           speakingRef.current = false;
           speakGuardUntilRef.current = Date.now() + 400;
           lastActivityRef.current = Date.now();
-          setStatus(micOn ? 'listening' : 'ready');
+          setStatus(micOn ? 'listening' : 'mic-off');
+          // <-- Explicitly re-arm recognition after TTS so user can reply
+          if (micOn) safeRestartRecognition();
         };
         src.start(0);
         ttsSourceRef.current = src;
@@ -193,18 +207,18 @@ export default function EmbedPage() {
       }
     } catch {}
 
-    // Browser TTS fallback
+    // Browser fallback (speechSynthesis)
     try {
       await ensureAudioGraph();
       window.speechSynthesis.cancel();
       const u = new SpeechSynthesisUtterance(text);
-      const choose = () => {
+      const pick = () => {
         const vs = window.speechSynthesis.getVoices();
         let v = vs.find(v => /en[-_]AU/i.test(v.lang) && /(william|cooper|male|australi)/i.test(v.name));
         if (!v) v = vs.find(v => /en[-_]AU/i.test(v.lang));
         return v || vs[0];
       };
-      u.voice = choose();
+      u.voice = pick();
       u.rate = 1.15;
       u.pitch = 1.08;
       u.onstart = () => { lastActivityRef.current = Date.now(); setStatus('speaking'); };
@@ -212,17 +226,32 @@ export default function EmbedPage() {
         speakingRef.current = false;
         speakGuardUntilRef.current = Date.now() + 400;
         lastActivityRef.current = Date.now();
-        setStatus(micOn ? 'listening' : 'ready');
+        setStatus(micOn ? 'listening' : 'mic-off');
+        if (micOn) safeRestartRecognition();
       };
       if (!muted) window.speechSynthesis.speak(u);
     } catch {}
   }, [ensureAudioGraph, micOn, muted]);
 
-  /* ---------------- Speech Recognition (Web Speech) ---------------- */
-  const startRecognition = useCallback(() => {
-    const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+  /* ------------------ Speech Recognition (Web Speech) ------------------ */
+  const SR = typeof window !== 'undefined' ? (window.SpeechRecognition || window.webkitSpeechRecognition) : null;
+
+  const clearRecIdleTimer = () => { if (recIdleTimerRef.current) { clearTimeout(recIdleTimerRef.current); recIdleTimerRef.current = null; } };
+  const armRecIdleTimer = () => {
+    clearRecIdleTimer();
+    // If recognition produces no events for 30s (and we're not speaking), restart it.
+    recIdleTimerRef.current = setTimeout(() => {
+      if (!micOn || speakingRef.current) return;
+      // Soft restart to un-stick Chrome
+      try { recognitionRef.current?.stop?.(); } catch {}
+      setTimeout(() => { if (micOn && !speakingRef.current) startRecognition(true); }, 250);
+    }, 30000);
+  };
+
+  const startRecognition = useCallback((soft = false) => {
     if (!SR) {
       setMessages(m => [...m, { role: 'assistant', content: 'This browser does not support voice input.' }]);
+      setStatus('error');
       return false;
     }
     try { recognitionRef.current?.stop?.(); } catch {}
@@ -232,25 +261,52 @@ export default function EmbedPage() {
     rec.interimResults = false;
     rec.lang = 'en-AU';
 
-    rec.onstart = () => { lastActivityRef.current = Date.now(); setStatus('listening'); };
+    rec.onstart = () => {
+      recActiveRef.current = true;
+      recRestartAttemptsRef.current = 0;
+      lastActivityRef.current = Date.now();
+      setStatus('listening');
+      setStatusNote('');
+      armRecIdleTimer();
+    };
 
-    rec.onerror = () => {
-      if (micOn) {
-        clearTimeout(reconnTimerRef.current);
-        reconnTimerRef.current = setTimeout(() => { try { startRecognition(); } catch {} }, 600);
+    rec.onspeechstart = armRecIdleTimer;
+    rec.onaudiostart = armRecIdleTimer;
+    rec.onsoundstart  = armRecIdleTimer;
+
+    rec.onerror = (ev) => {
+      // Frequent 'no-speech' & 'audio-capture' happen—try gentle restarts.
+      recActiveRef.current = false;
+      clearRecIdleTimer();
+      if (!micOn) return;
+      if (speakingRef.current || Date.now() < speakGuardUntilRef.current) return;
+      if (recRestartAttemptsRef.current < 2) {
+        recRestartAttemptsRef.current++;
+        setTimeout(() => { if (micOn) startRecognition(true); }, 600);
+      } else {
+        stopMic('Mic auto-stopped. Toggle Mic on to speak.');
       }
     };
 
     rec.onend = () => {
-      if (micOn) {
-        clearTimeout(reconnTimerRef.current);
-        reconnTimerRef.current = setTimeout(() => { try { startRecognition(); } catch {} }, 300);
+      recActiveRef.current = false;
+      clearRecIdleTimer();
+      if (!micOn) { setStatus('mic-off'); return; }
+      if (speakingRef.current || Date.now() < speakGuardUntilRef.current) {
+        // Will be re-armed by TTS onend
+        return;
+      }
+      // Soft auto-retry once; if Chrome keeps killing it, we toggle mic off
+      if (recRestartAttemptsRef.current < 2) {
+        recRestartAttemptsRef.current++;
+        setTimeout(() => { if (micOn) startRecognition(true); }, 300);
       } else {
-        setStatus('ready');
+        stopMic('Mic auto-stopped. Toggle Mic on to speak.');
       }
     };
 
     rec.onresult = (e) => {
+      armRecIdleTimer();
       lastActivityRef.current = Date.now();
       if (speakingRef.current || Date.now() < speakGuardUntilRef.current) return;
       for (let i = e.resultIndex; i < e.results.length; i++) {
@@ -267,56 +323,44 @@ export default function EmbedPage() {
     try { rec.start(); } catch {}
     recognitionRef.current = rec;
     return true;
-  }, [micOn, sendToAgent]);
+  }, [SR, micOn, sendToAgent]);
 
-  /* -------------------- Mic lifecycle -------------------- */
+  const safeRestartRecognition = useCallback(() => {
+    try { recognitionRef.current?.stop?.(); } catch {}
+    setTimeout(() => { if (micOn) startRecognition(true); }, 150);
+  }, [micOn, startRecognition]);
+
+  /* ------------------ Mic lifecycle ------------------ */
   const startMic = useCallback(async () => {
     try {
       await ensureAudioGraph();
-      await navigator.mediaDevices.getUserMedia({ audio: true }); // permission + echo-cancel from OS
-      micStreamRef.current = true; // we don't route mic → speakers
-      setStatusNote('');
+      await navigator.mediaDevices.getUserMedia({ audio: true }); // permission; OS handles echo-cancel
+      micStreamRef.current = true;
       setMicOn(true);
+      setStatus('listening');
+      setStatusNote('');
       lastActivityRef.current = Date.now();
       startRecognition();
-      setStatus('listening');
       return true;
     } catch {
-      setStatus('ready');
-      setStatusNote('Please allow microphone access to talk.');
       setMicOn(false);
+      setStatus('mic-off');
+      setStatusNote('Please allow microphone access to talk.');
       return false;
     }
   }, [ensureAudioGraph, startRecognition]);
 
   const stopMic = useCallback((hint) => {
-    try { recognitionRef.current?.stop?.(); } catch {}
     micStreamRef.current = null;
+    try { recognitionRef.current?.stop?.(); } catch {}
+    recActiveRef.current = false;
+    clearRecIdleTimer();
     setMicOn(false);
-    if (!speakingRef.current) setStatus('ready');
+    setStatus('mic-off');
     if (hint) setStatusNote(hint);
   }, []);
 
-  // Inactivity watchdog — measured from last activity, skips while speaking
-  useEffect(() => {
-    if (!micOn) return;
-    const iv = setInterval(() => {
-      if (!micOn) return;
-      if (speakingRef.current) { lastActivityRef.current = Date.now(); return; }
-      const idle = Date.now() - lastActivityRef.current;
-      if (idle >= INACTIVITY_MS) {
-        stopMic('Mic auto-stopped due to inactivity. Toggle Mic on to speak.');
-      }
-    }, 1000);
-    return () => clearInterval(iv);
-  }, [micOn, stopMic]);
-
-  /* -------------------- UI handlers -------------------- */
-  const handleToggleMic = useCallback(async () => {
-    if (micOn) stopMic();
-    else await startMic();
-  }, [micOn, startMic, stopMic]);
-
+  /* ------------------ Sound toggle ------------------ */
   const handleToggleMute = useCallback(async () => {
     const next = !muted;
     setMuted(next);
@@ -328,6 +372,11 @@ export default function EmbedPage() {
     }
   }, [muted, ensureAudioGraph, speak]);
 
+  const handleToggleMic = useCallback(async () => {
+    if (micOn) stopMic();
+    else await startMic();
+  }, [micOn, startMic, stopMic]);
+
   const handleRestart = useCallback(async () => {
     stopMic();
     setMessages([{ role: 'assistant', content: "Let's start fresh—what would you like to do?" }]);
@@ -336,7 +385,7 @@ export default function EmbedPage() {
     if (cid) await startMic();
   }, [startChat, startMic, stopMic]);
 
-  /* ----------------- open/close messages from embed.js ----------------- */
+  /* ------------------ embed.js open/close messages ------------------ */
   useEffect(() => {
     function onMsg(e) {
       const t = e?.data?.type;
@@ -364,6 +413,7 @@ export default function EmbedPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  /* ------------------ Send text ------------------ */
   const handleSend = useCallback(async () => {
     const text = input.trim();
     if (!text) return;
@@ -372,14 +422,14 @@ export default function EmbedPage() {
     await sendToAgent(text);
   }, [input, sendToAgent]);
 
-  /* ---------------------------- UI ---------------------------- */
+  /* ------------------ UI ------------------ */
   return (
     <div className="wrap">
       <div className="panel">
         <header className="bar">
           <div className="title">
             <strong>Otto</strong> — Your Auto-Mate!
-            <span className={`pill ${status}`}>{status}</span>
+            <span className={`pill ${status}`}>{status.replace('-', ' ')}</span>
             {statusNote && <span className="hint">{statusNote}</span>}
           </div>
           <div className="controls">
@@ -433,6 +483,7 @@ export default function EmbedPage() {
       <style jsx>{`
         .wrap { height: 100vh; background: #0b0f19; color: #dbe7ff; }
         .panel { height: 100%; display: flex; flex-direction: column; }
+
         .bar {
           flex: 0 0 50px; display: flex; align-items: center; justify-content: space-between;
           padding: 0 12px; background: rgba(20, 26, 40, 0.9);
@@ -443,8 +494,10 @@ export default function EmbedPage() {
         .pill { font-size: 12px; padding: 2px 8px; border-radius: 999px; background: #1f2937; color:#a5b4fc; text-transform: capitalize; }
         .pill.listening { background: #0b3b2f; color: #34d399; }
         .pill.speaking  { background: #1e3a8a; color: #93c5fd; }
+        .pill['mic-off'] {}
         .pill.error     { background: #3f1d1d; color: #fca5a5; }
-        .hint { font-size: 12px; opacity: .85; color: #9fb3ff; }
+        .hint { font-size: 12px; opacity: .88; color: #9fb3ff; }
+
         .controls { display:flex; gap:8px; }
         .btn {
           display: inline-flex; align-items: center; gap: 6px;
