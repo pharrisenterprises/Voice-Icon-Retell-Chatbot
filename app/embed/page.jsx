@@ -228,12 +228,12 @@ export default function EmbedPage() {
         return v || vs[0];
       };
 
-      // Use a slight speed/pitch lift for “energetic Otto”
+      // Slight speed/pitch lift for energetic Otto
       u.voice = pickVoice();
       u.rate = 1.15;
       u.pitch = 1.08;
 
-      u.onstart = () => setStatus('speaking'));
+      u.onstart = () => setStatus('speaking');
       u.onend = () => {
         speakingRef.current = false;
         speakGuardUntilRef.current = Date.now() + 400;
@@ -264,7 +264,7 @@ export default function EmbedPage() {
     rec.lang = 'en-AU';
 
     rec.onstart = () => setStatus('listening');
-    rec.onerror = (_e) => {
+    rec.onerror = () => {
       // Chrome often fires 'no-speech' / 'audio-capture' etc.; just attempt to restart.
       if (micOn) {
         clearTimeout(reconnTimerRef.current);
