@@ -103,6 +103,13 @@ export default function EmbedPage() {
   const speakingRef = useRef(false);
   const speakGuardUntilRef = useRef(0);
 
+  // Track last assistant message (for post-unmute replay)
+  const lastAssistantRef = useRef({ text: '', ts: 0 });
+
+  // Inactivity timer (auto-off)
+  const lastVoiceActivityRef = useRef(Date.now());
+  const INACTIVITY_MS = 20000; // ~20s desired
+
   // Open/close event wiring from parent embed.js
   const openedRef = useRef(false);
 
@@ -159,7 +166,11 @@ export default function EmbedPage() {
       });
       const j = await r.json();
       if (j?.ok && j?.reply) {
-        setMessages((m) => [...m, { role: 'assistant', content: j.reply }]);
+        setMessages((m) => {
+          const next = [...m, { role: 'assistant', content: j.reply }];
+          lastAssistantRef.current = { text: j.reply, ts: Date.now() };
+          return next;
+        });
         if (!muted) await speak(j.reply);
       } else {
         setMessages((m) => [
@@ -263,27 +274,36 @@ export default function EmbedPage() {
     rec.interimResults = false;      // reduces duplicates / feedback loops
     rec.lang = 'en-AU';
 
-    rec.onstart = () => setStatus('listening');
+    rec.onstart = () => {
+      lastVoiceActivityRef.current = Date.now();
+      setStatus('listening');
+    };
+
     rec.onerror = () => {
       // Chrome often fires 'no-speech' / 'audio-capture' etc.; just attempt to restart.
       if (micOn) {
         clearTimeout(reconnTimerRef.current);
         reconnTimerRef.current = setTimeout(() => {
-          try { recognitionRef.current?.start?.(); } catch {}
+          try { startRecognition(); } catch {}
         }, 600);
       }
     };
+
     rec.onend = () => {
+      // Recognition commonly ends after a silence window; if mic is still on, recreate recognizer.
       if (micOn) {
         clearTimeout(reconnTimerRef.current);
         reconnTimerRef.current = setTimeout(() => {
-          try { recognitionRef.current?.start?.(); } catch {}
+          try { startRecognition(); } catch {}
         }, 300);
       } else {
         setStatus('ready');
       }
     };
+
     rec.onresult = (e) => {
+      lastVoiceActivityRef.current = Date.now();
+
       // If we’re speaking or within the guard window, ignore
       if (speakingRef.current || Date.now() < speakGuardUntilRef.current) return;
 
@@ -311,6 +331,7 @@ export default function EmbedPage() {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       micStreamRef.current = stream;     // not piped to speakers => no acoustic echo
       setMicOn(true);
+      lastVoiceActivityRef.current = Date.now();
       startRecognition();
       setStatus('listening');
       return true;
@@ -322,7 +343,7 @@ export default function EmbedPage() {
     }
   }, [ensureAudioGraph, startRecognition]);
 
-  const stopMic = useCallback(() => {
+  const stopMic = useCallback((hintMessage) => {
     try { recognitionRef.current?.stop?.(); } catch {}
     try {
       micStreamRef.current?.getTracks?.().forEach(t => t.stop());
@@ -330,7 +351,23 @@ export default function EmbedPage() {
     micStreamRef.current = null;
     setMicOn(false);
     if (!speakingRef.current) setStatus('ready');
+    if (hintMessage) {
+      setMessages(m => [...m, { role: 'assistant', content: hintMessage }]);
+    }
   }, []);
+
+  // Inactivity auto-off watcher
+  useEffect(() => {
+    if (!micOn) return;
+    const iv = setInterval(() => {
+      if (!micOn) return;
+      const idle = Date.now() - lastVoiceActivityRef.current;
+      if (idle >= INACTIVITY_MS) {
+        stopMic('Mic auto-stopped due to inactivity. Toggle Mic on to speak.');
+      }
+    }, 1000);
+    return () => clearInterval(iv);
+  }, [micOn, stopMic]);
 
   /* ------------------- UI control handlers ------------------ */
 
@@ -344,7 +381,15 @@ export default function EmbedPage() {
     setMuted(next);
     await ensureAudioGraph();
     if (gainRef.current) gainRef.current.gain.value = next ? 0 : 1;
-  }, [muted, ensureAudioGraph]);
+
+    // If we’re unmuting and there’s a recent assistant message you likely missed, replay it.
+    if (!next) {
+      const { text, ts } = lastAssistantRef.current || {};
+      if (text && Date.now() - ts < 15000 && !speakingRef.current) {
+        await speak(text);
+      }
+    }
+  }, [muted, ensureAudioGraph, speak]);
 
   const handleRestart = useCallback(async () => {
     stopMic();
@@ -413,7 +458,7 @@ export default function EmbedPage() {
       <div className="panel">
         <header className="bar">
           <div className="title">
-            <strong>Otto</strong> – Auto-Mate
+            <strong>Otto</strong> — Your Auto-Mate!
             <span className={`dot ${status}`}>{status}</span>
           </div>
           <div className="controls">
