@@ -2,7 +2,7 @@
 
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 
-// Canvas visualizer that reacts to either mic or playback (AudioNode)
+/* ==================== Visualizer (neon glow) ==================== */
 function Visualizer({ analyser }) {
   const canvasRef = useRef(null);
 
@@ -10,41 +10,49 @@ function Visualizer({ analyser }) {
     let raf = 0;
     const canvas = canvasRef.current;
     if (!canvas) return;
-
     const ctx = canvas.getContext('2d');
+
+    function drawIdle() {
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      const bars = 44;
+      const barW = canvas.width / bars;
+      for (let i = 0; i < bars; i++) {
+        const h = 6 + 4 * Math.sin((Date.now() / 340) + i * 0.55);
+        const x = i * barW + barW * 0.25;
+        neonBar(ctx, x, canvas.height - h, barW * 0.5, h, 0.35);
+      }
+    }
+
     const bufLen = analyser?.frequencyBinCount || 0;
     const data = new Uint8Array(bufLen);
 
+    function neonBar(ctx, x, y, w, h, intensity = 1) {
+      const g = ctx.createLinearGradient(0, y - h, 0, y);
+      g.addColorStop(0, '#7DD3FC'); // sky-300
+      g.addColorStop(1, '#60A5FA'); // blue-400
+      ctx.fillStyle = g;
+      ctx.shadowColor = '#60A5FA';
+      ctx.shadowBlur = 18 * intensity;
+      ctx.fillRect(x, y - h, w, h);
+      ctx.shadowBlur = 0;
+    }
+
     function draw() {
       raf = requestAnimationFrame(draw);
-      if (!analyser) {
-        // idle shimmer
-        ctx.clearRect(0, 0, canvas.width, canvas.height);
-        ctx.fillStyle = '#1f2937';
-        const barW = canvas.width / 32;
-        for (let i = 0; i < 32; i++) {
-          const h = 6 + 3 * Math.sin((Date.now() / 300) + i * 0.6);
-          const x = i * barW + barW * 0.2;
-          ctx.fillRect(x, canvas.height - h, barW * 0.6, h);
-        }
-        return;
-      }
+      if (!analyser) { drawIdle(); return; }
 
       analyser.getByteFrequencyData(data);
       ctx.clearRect(0, 0, canvas.width, canvas.height);
-      const bars = 40;
-      const step = Math.floor(data.length / bars);
+
+      const bars = 44;
+      const step = Math.max(1, Math.floor(data.length / bars));
       const barW = canvas.width / bars;
+
       for (let i = 0; i < bars; i++) {
         const v = data[i * step] / 255; // 0..1
-        const h = Math.max(4, v * canvas.height * 0.9);
-        // gradient-ish
-        const g = ctx.createLinearGradient(0, canvas.height - h, 0, canvas.height);
-        g.addColorStop(0, '#6EE7F9');
-        g.addColorStop(1, '#4185F4');
-        ctx.fillStyle = g;
-        const x = i * barW + barW * 0.2;
-        ctx.fillRect(x, canvas.height - h, barW * 0.6, h);
+        const h = Math.max(6, v * canvas.height * 0.88);
+        const x = i * barW + barW * 0.25;
+        neonBar(ctx, x, canvas.height - h, barW * 0.5, h, 0.8 + v * 0.7);
       }
     }
 
@@ -55,26 +63,29 @@ function Visualizer({ analyser }) {
   return (
     <canvas
       ref={canvasRef}
-      width={1200}
-      height={260}
+      width={1400}
+      height={280}
       style={{ width: '100%', height: '100%' }}
       aria-hidden="true"
     />
   );
 }
 
+/* =========================== Page ============================ */
 export default function EmbedPage() {
-  // state
-  const [status, setStatus] = useState('idle'); // idle | ready | listening | speaking | error
+  // status & chat
+  const [status, setStatus] = useState('ready'); // ready | listening | speaking | error
   const [chatId, setChatId] = useState(null);
   const [messages, setMessages] = useState(() => [
-    { role: 'assistant', content: "G'day! I'm Otto. Type below or click the mic to chat." },
+    { role: 'assistant', content: "G'day! I’m Otto 👋  Type below or click the mic to talk." },
   ]);
   const [input, setInput] = useState('');
+
+  // controls
   const [micOn, setMicOn] = useState(false);
   const [muted, setMuted] = useState(false);
 
-  // audio graph
+  // audio graph nodes
   const audioCtxRef = useRef(null);
   const gainRef = useRef(null);
   const analyserRef = useRef(null);
@@ -84,11 +95,11 @@ export default function EmbedPage() {
   // speech recognition
   const recognitionRef = useRef(null);
 
-  // transcript scrolling
+  // autoscroll
   const endRef = useRef(null);
   useEffect(() => { endRef.current?.scrollIntoView({ behavior: 'smooth' }); }, [messages.length]);
 
-  // create audio context lazily on first user gesture (clicking mic or play)
+  /* --------- helpers --------- */
   const ensureAudioGraph = useCallback(async () => {
     if (!audioCtxRef.current) {
       const Ctx = window.AudioContext || window.webkitAudioContext;
@@ -96,11 +107,10 @@ export default function EmbedPage() {
       const gain = ctx.createGain();
       const analyser = ctx.createAnalyser();
       analyser.fftSize = 1024;
-      analyser.smoothingTimeConstant = 0.85;
+      analyser.smoothingTimeConstant = 0.86;
       gain.gain.value = muted ? 0 : 1;
       gain.connect(ctx.destination);
       analyser.connect(gain);
-
       audioCtxRef.current = ctx;
       gainRef.current = gain;
       analyserRef.current = analyser;
@@ -108,32 +118,24 @@ export default function EmbedPage() {
     if (audioCtxRef.current.state !== 'running') {
       try { await audioCtxRef.current.resume(); } catch {}
     }
-    return !!audioCtxRef.current;
+    return true;
   }, [muted]);
 
-  // start a Retell chat session (cheap text chat)
   const startChat = useCallback(async () => {
     try {
       const r = await fetch('/api/retell-chat/start');
       const j = await r.json();
       if (j?.ok && j?.chatId) {
         setChatId(j.chatId);
-        setStatus('ready');
         return j.chatId;
       }
-      throw new Error('start failed');
-    } catch (e) {
-      console.error('start error', e);
-      setStatus('error');
-      return null;
-    }
+    } catch {}
+    setStatus('error');
+    return null;
   }, []);
 
-  // send text to agent → speak back
   const speak = useCallback(async (text) => {
     if (!text) return;
-
-    // Try Azure TTS
     try {
       await ensureAudioGraph();
       const res = await fetch('/api/tts/speak', {
@@ -141,31 +143,27 @@ export default function EmbedPage() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ text }),
       });
-
       if (res.ok && res.headers.get('Content-Type')?.includes('audio/')) {
-        const arr = await res.arrayBuffer();
+        const buf = await res.arrayBuffer();
         const ctx = audioCtxRef.current;
-        const buffer = await ctx.decodeAudioData(arr.slice(0));
+        const audioBuf = await ctx.decodeAudioData(buf.slice(0));
         const src = ctx.createBufferSource();
-        src.buffer = buffer;
-        // visualizer hookup
+        src.buffer = audioBuf;
         if (analyserRef.current) src.connect(analyserRef.current);
         src.connect(gainRef.current || ctx.destination);
-
         setStatus('speaking');
         src.onended = () => setStatus(micOn ? 'listening' : 'ready');
         src.start(0);
         return;
       }
     } catch (e) {
-      console.warn('Azure TTS failed, falling back to Web Speech:', e);
+      console.warn('Azure TTS failed, falling back:', e);
     }
 
-    // Fallback: browser TTS (quick & simple)
+    // fallback (browser voice)
     try {
       await ensureAudioGraph();
       const u = new SpeechSynthesisUtterance(text);
-      // let browser pick en-AU if available
       const pick = () => {
         const vs = window.speechSynthesis.getVoices();
         let v = vs.find(v => /en[-_]AU/i.test(v.lang) && /william|cooper|male|australi/i.test(v.name));
@@ -173,22 +171,19 @@ export default function EmbedPage() {
         return v || vs[0];
       };
       u.voice = pick();
-      u.rate = 1.15; // modest pep for fallback
+      u.rate = 1.15;
       u.onstart = () => setStatus('speaking');
       u.onend = () => setStatus(micOn ? 'listening' : 'ready');
       if (!muted) {
         window.speechSynthesis.cancel();
         window.speechSynthesis.speak(u);
       }
-    } catch (e) {
-      console.warn('speechSynthesis error:', e);
-    }
+    } catch {}
   }, [ensureAudioGraph, micOn, muted]);
 
   const sendToAgent = useCallback(async (text) => {
     const cid = chatId || (await startChat());
     if (!cid) return;
-
     try {
       const r = await fetch('/api/retell-chat/send', {
         method: 'POST',
@@ -207,7 +202,7 @@ export default function EmbedPage() {
     }
   }, [chatId, startChat, speak, muted]);
 
-  // mic handling
+  /* --------- mic handling --------- */
   const startRecognition = useCallback(() => {
     const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
     if (!SR) {
@@ -220,12 +215,7 @@ export default function EmbedPage() {
     rec.lang = 'en-AU';
     rec.onstart = () => setStatus('listening');
     rec.onend = () => {
-      // if still micOn, resume (mobile may auto-stop)
-      if (micOn) {
-        try { rec.start(); } catch {}
-      } else {
-        setStatus('ready');
-      }
+      if (micOn) { try { rec.start(); } catch {} } else { setStatus('ready'); }
     };
     rec.onerror = () => setStatus('error');
     rec.onresult = (ev) => {
@@ -240,9 +230,8 @@ export default function EmbedPage() {
         sendToAgent(finalText);
       }
     };
-
     try { rec.start(); recognitionRef.current = rec; return true; }
-    catch (e) { console.warn('rec.start failed', e); return false; }
+    catch { return false; }
   }, [micOn, sendToAgent]);
 
   const stopRecognition = useCallback(() => {
@@ -255,40 +244,28 @@ export default function EmbedPage() {
     if (micOn) {
       setMicOn(false);
       stopRecognition();
-      // stop mic tracks & disconnect analyser input
-      try {
-        micSourceRef.current?.disconnect();
-        micSourceRef.current = null;
-      } catch {}
-      if (micStreamRef.current) {
-        micStreamRef.current.getTracks().forEach(t => t.stop());
-        micStreamRef.current = null;
-      }
+      try { micSourceRef.current?.disconnect(); micSourceRef.current = null; } catch {}
+      if (micStreamRef.current) { micStreamRef.current.getTracks().forEach(t => t.stop()); micStreamRef.current = null; }
       setStatus('ready');
       return;
     }
-    // turn ON
-    const okAudio = await ensureAudioGraph(); // user gesture
-    if (!okAudio) return;
+    await ensureAudioGraph(); // user gesture; resumes context
 
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       micStreamRef.current = stream;
       if (audioCtxRef.current && analyserRef.current) {
-        // hook mic to analyser for live bars
         const src = audioCtxRef.current.createMediaStreamSource(stream);
         micSourceRef.current = src;
         src.connect(analyserRef.current);
       }
-    } catch (e) {
+    } catch {
       setMessages(m => [...m, { role: 'assistant', content: 'Mic permission was blocked.' }]);
       return;
     }
 
-    if (!(await startChat())) return; // ensure we have a chat session
-    if (startRecognition()) {
-      setMicOn(true);
-    }
+    if (!(await startChat())) return;
+    if (startRecognition()) setMicOn(true);
   }, [micOn, ensureAudioGraph, startChat, startRecognition, stopRecognition]);
 
   const toggleMute = useCallback(() => {
@@ -308,76 +285,148 @@ export default function EmbedPage() {
     await sendToAgent(t);
   }, [input, sendToAgent]);
 
-  // Initialize a chat silently on load (for fast first reply); mic stays OFF.
+  // warm chat
   useEffect(() => { startChat(); }, [startChat]);
 
+  /* -------------------- UI -------------------- */
   return (
-    <div className="h-screen w-screen bg-[#0B0F19] text-[#E6E8EE] flex flex-col">
-      {/* Top half: waveform */}
-      <div className="flex-1 relative border-b border-white/10">
-        <Visualizer analyser={analyserRef.current} />
+    <div className="wrap">
+      {/* header */}
+      <div className="hdr">
+        <div className="hdr-left">
+          <div className="pulse" aria-hidden />
+          <div className="title">Otto – Auto-Mate</div>
+        </div>
+        <div className="hdr-right">
+          <button
+            className={`btn ${micOn ? 'btn-on' : ''}`}
+            onClick={toggleMic}
+            title={micOn ? 'Turn mic off' : 'Turn mic on'}
+            aria-label="Mic"
+          >
+            <span className="ico">🎙️</span>{micOn ? 'Mic On' : 'Mic Off'}
+          </button>
+          <button
+            className={`btn ${muted ? 'btn-off' : ''}`}
+            onClick={toggleMute}
+            title={muted ? 'Unmute' : 'Mute output'}
+            aria-label="Mute output"
+          >
+            <span className="ico">🔈</span>{muted ? 'Muted' : 'Sound On'}
+          </button>
+        </div>
       </div>
 
-      {/* Bottom half: chat + controls */}
-      <div className="flex-[1] min-h-[50%] max-h-[50%] flex flex-col">
-        {/* Controls */}
-        <div className="flex items-center gap-2 p-3 border-b border-white/10">
-          <span className="text-xs opacity-80">
-            {status === 'speaking' ? 'Otto is speaking' :
-             status === 'listening' ? 'Listening…' :
-             status === 'ready' ? 'Ready' :
-             status}
-          </span>
-          <div className="ml-auto flex items-center gap-2">
-            <button
-              onClick={toggleMic}
-              title={micOn ? 'Turn mic off' : 'Turn mic on'}
-              aria-label="Mic"
-              className={`px-3 py-2 rounded border text-sm ${micOn ? 'bg-[#1F2937] border-white/20' : 'bg-transparent border-white/20 hover:bg-white/10'}`}
-            >
-              🎙️ {micOn ? 'On' : 'Off'}
-            </button>
-            <button
-              onClick={toggleMute}
-              title={muted ? 'Unmute' : 'Mute output'}
-              aria-label="Mute output"
-              className="px-3 py-2 rounded border border-white/20 text-sm hover:bg-white/10"
-            >
-              🔈 {muted ? 'Off' : 'On'}
-            </button>
-          </div>
-        </div>
+      {/* visualizer */}
+      <div className="viz">
+        <Visualizer analyser={analyserRef.current} />
+        <div className={`status ${status}`}>{status === 'speaking' ? 'Otto is speaking' : status === 'listening' ? 'Listening…' : 'Ready'}</div>
+      </div>
 
-        {/* transcript */}
-        <div className="flex-1 overflow-y-auto p-3 space-y-2">
+      {/* transcript */}
+      <div className="chat">
+        <div className="msgs">
           {messages.map((m, i) => (
-            <div key={i} className={`max-w-[80%] px-3 py-2 rounded ${m.role==='user'?'ml-auto bg-white/10':'bg-white/5'}`}>
+            <div key={i} className={`msg ${m.role}`}>
               {m.content}
             </div>
           ))}
           <div ref={endRef} />
         </div>
-
-        {/* input */}
-        <form onSubmit={onSubmit} className="p-3 border-t border-white/10 flex gap-2">
+        <form className="composer" onSubmit={onSubmit}>
           <input
-            className="flex-1 rounded bg-transparent border border-white/20 px-3 py-2 outline-none focus:border-white/40"
+            aria-label="Type message"
             placeholder={`Type a message… ${micOn ? '(mic is on)' : ''}`}
             value={input}
             onChange={(e) => setInput(e.target.value)}
             autoFocus={!micOn}
-            aria-label="Type message"
           />
-          <button
-            type="submit"
-            className="px-3 py-2 rounded bg-white/10 hover:bg-white/20 border border-white/20"
-            title="Send message"
-            aria-label="Send"
-          >
-            ➤
-          </button>
+          <button type="submit" className="send" title="Send">➤</button>
         </form>
       </div>
+
+      {/* styles */}
+      <style jsx>{`
+        .wrap {
+          position: fixed; inset: 0;
+          display: grid; grid-template-rows: 56px 1fr 1fr;
+          background: radial-gradient(1200px 600px at 100% -10%, rgba(96,165,250,.15), transparent),
+                      radial-gradient(900px 500px at -10% 110%, rgba(56,189,248,.12), transparent),
+                      #0B0F19;
+          color: #E6E8EE;
+          font: 14px/1.4 ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial;
+        }
+        .hdr {
+          display: flex; align-items: center; justify-content: space-between;
+          padding: 10px 12px;
+          border-bottom: 1px solid rgba(255,255,255,.08);
+          backdrop-filter: blur(10px);
+          background: linear-gradient(180deg, rgba(255,255,255,.06), rgba(255,255,255,.02));
+        }
+        .hdr-left { display: flex; align-items: center; gap: 10px; }
+        .pulse {
+          width: 12px; height: 12px; border-radius: 50%;
+          background: #34D399; box-shadow: 0 0 14px #34D399, 0 0 30px rgba(52,211,153,.6);
+          animation: pulse 2.2s infinite;
+        }
+        @keyframes pulse {
+          0% { box-shadow: 0 0 12px #34D399, 0 0 24px rgba(52,211,153,.5); }
+          50% { box-shadow: 0 0 18px #34D399, 0 0 36px rgba(52,211,153,.8); }
+          100% { box-shadow: 0 0 12px #34D399, 0 0 24px rgba(52,211,153,.5); }
+        }
+        .title { font-weight: 600; letter-spacing: .3px; opacity: .95; }
+        .hdr-right { display: flex; gap: 8px; }
+
+        .btn {
+          display: inline-flex; align-items: center; gap: 8px;
+          padding: 8px 12px; border-radius: 999px;
+          background: rgba(255,255,255,.06);
+          border: 1px solid rgba(255,255,255,.12);
+          color: #E6E8EE; cursor: pointer;
+          transition: transform .06s ease, background .2s ease, border-color .2s ease;
+          will-change: transform;
+        }
+        .btn:hover { background: rgba(255,255,255,.1); border-color: rgba(255,255,255,.2); transform: translateY(-1px); }
+        .btn:active { transform: translateY(0px) scale(.99); }
+        .btn-on { background: linear-gradient(90deg, rgba(125,211,252,.22), rgba(96,165,250,.22)); border-color: rgba(125,211,252,.4); }
+        .btn-off { background: rgba(255,255,255,.04); opacity: .9; }
+
+        .viz {
+          position: relative;
+          border-bottom: 1px solid rgba(255,255,255,.08);
+          padding: 6px 8px;
+        }
+        .status {
+          position: absolute; right: 12px; top: 10px;
+          font-size: 12px; opacity: .8;
+          padding: 4px 8px; border-radius: 999px;
+          background: rgba(255,255,255,.06); border: 1px solid rgba(255,255,255,.12);
+        }
+
+        .chat { display: grid; grid-template-rows: 1fr auto; }
+        .msgs { overflow-y: auto; padding: 10px 12px; gap: 8px; display: flex; flex-direction: column; }
+        .msg { max-width: 80%; padding: 10px 12px; border-radius: 12px; }
+        .msg.assistant { background: rgba(255,255,255,.06); border: 1px solid rgba(255,255,255,.08); }
+        .msg.user { margin-left: auto; background: rgba(125,211,252,.14); border: 1px solid rgba(125,211,252,.35); }
+
+        .composer { display: flex; gap: 8px; padding: 10px 12px; border-top: 1px solid rgba(255,255,255,.08); }
+        .composer input {
+          flex: 1; border-radius: 12px; padding: 10px 12px;
+          background: rgba(255,255,255,.04); border: 1px solid rgba(255,255,255,.12);
+          color: #E6E8EE; outline: none;
+        }
+        .composer input:focus { border-color: rgba(125,211,252,.55); box-shadow: 0 0 0 3px rgba(125,211,252,.15) inset; }
+        .send {
+          padding: 10px 14px; border-radius: 12px;
+          background: linear-gradient(90deg, rgba(125,211,252,.22), rgba(96,165,250,.22));
+          border: 1px solid rgba(125,211,252,.4); color: #E6E8EE; cursor: pointer;
+        }
+
+        @media (max-width: 480px) {
+          .wrap { grid-template-rows: 56px 160px 1fr; }
+          .msg { max-width: 92%; }
+        }
+      `}</style>
     </div>
   );
 }
