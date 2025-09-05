@@ -75,6 +75,8 @@ export default function EmbedPage() {
   const recognitionRef = useRef(null);
   const resumeAfterSpeakRef = useRef(false);
 
+  const autostartAttemptedRef = useRef(false);
+
   const ensureAudioGraph = useCallback(async () => {
     if (!audioCtxRef.current) {
       const Ctx = window.AudioContext || window.webkitAudioContext;
@@ -88,7 +90,8 @@ export default function EmbedPage() {
       analyser.connect(gain);
       audioCtxRef.current = ctx; gainRef.current = gain; analyserRef.current = analyser;
     }
-    if (audioCtxRef.current.state !== 'running') try { await audioCtxRef.current.resume(); } catch {}
+    // Try to resume (may be ignored without a gesture; that's OK for mic)
+    try { if (audioCtxRef.current.state !== 'running') await audioCtxRef.current.resume(); } catch {}
     return true;
   }, [muted]);
 
@@ -193,9 +196,15 @@ export default function EmbedPage() {
   }, []);
 
   const startMic = useCallback(async () => {
-    await ensureAudioGraph(); // user gesture path or postMessage(open)
+    // If it's already on, do nothing
+    if (micOn) return true;
+
+    await ensureAudioGraph(); // fine if resume is ignored until a gesture
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true } });
+      // getUserMedia can trigger a permission prompt without an explicit gesture
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true }
+      });
       micStreamRef.current = stream;
       if (audioCtxRef.current && analyserRef.current) {
         const src = audioCtxRef.current.createMediaStreamSource(stream);
@@ -203,22 +212,25 @@ export default function EmbedPage() {
         src.connect(analyserRef.current);
       }
     } catch {
-      setMessages(m => [...m, { role: 'assistant', content: 'Mic permission was blocked.' }]);
+      setMessages(m => [...m, { role: 'assistant', content: 'Mic permission was blocked. Use the Mic button to try again.' }]);
       return false;
     }
+
     if (!(await startChat())) return false;
-    const ok = startRecognition(); if (ok) setMicOn(true);
+    const ok = startRecognition();
+    if (ok) setMicOn(true); else setStatus('error');
     return ok;
-  }, [ensureAudioGraph, startChat, startRecognition]);
+  }, [ensureAudioGraph, startChat, startRecognition, micOn]);
 
   const stopMic = useCallback(() => {
+    if (!micOn) return;
     setMicOn(false);
     stopRecognition();
     try { micSourceRef.current?.disconnect(); micSourceRef.current = null; } catch {}
     if (micStreamRef.current) { micStreamRef.current.getTracks().forEach(t => t.stop()); micStreamRef.current = null; }
     if (playingRef.current && srcRef.current) { try { srcRef.current.stop(0); } catch {} }
     setStatus('ready');
-  }, [stopRecognition]);
+  }, [stopRecognition, micOn]);
 
   const toggleMic = useCallback(async () => { if (micOn) stopMic(); else await startMic(); }, [micOn, startMic, stopMic]);
   const toggleMute = useCallback(() => { setMuted(v => { const n = !v; if (gainRef.current) gainRef.current.gain.value = n ? 0 : 1; return n; }); }, []);
@@ -232,7 +244,20 @@ export default function EmbedPage() {
   // warm chat
   useEffect(() => { startChat(); }, [startChat]);
 
-  // handle parent open/close
+  // auto-start mic if query has autostart=1
+  useEffect(() => {
+    if (autostartAttemptedRef.current) return;
+    autostartAttemptedRef.current = true;
+    try {
+      const usp = new URLSearchParams(window.location.search);
+      if (usp.get('autostart') === '1') {
+        // small delay so the panel is fully painted
+        setTimeout(() => { startMic(); }, 80);
+      }
+    } catch {}
+  }, [startMic]);
+
+  // handle parent open/close – also auto-start on open
   useEffect(() => {
     function onMsg(ev) {
       const type = ev?.data?.type;
@@ -249,10 +274,10 @@ export default function EmbedPage() {
       <div className="hdr">
         <div className="left"><div className="pulse" /> <div className="title">Otto – Auto-Mate</div></div>
         <div className="right">
-          <button className={`btn ${micOn ? 'on' : ''}`} onClick={toggleMic} title={micOn ? 'Turn mic off' : 'Turn mic on'} aria-label="Mic">
+          <button type="button" className={`btn ${micOn ? 'on' : ''}`} onClick={toggleMic} title={micOn ? 'Turn mic off' : 'Turn mic on'} aria-label="Mic">
             <span className="ico">🎙️</span>{micOn ? 'Mic On' : 'Mic Off'}
           </button>
-          <button className={`btn ${muted ? 'off' : ''}`} onClick={toggleMute} title={muted ? 'Unmute' : 'Mute output'} aria-label="Mute output">
+          <button type="button" className={`btn ${muted ? 'off' : ''}`} onClick={toggleMute} title={muted ? 'Unmute' : 'Mute output'} aria-label="Mute output">
             <span className="ico">🔈</span>{muted ? 'Muted' : 'Sound On'}
           </button>
         </div>
@@ -297,33 +322,4 @@ export default function EmbedPage() {
         }
         .left { display: flex; align-items: center; gap: 10px; }
         .pulse { width: 12px; height: 12px; border-radius: 50%; background: #34D399;
-          box-shadow: 0 0 14px #34D399, 0 0 30px rgba(52,211,153,.6); animation: p 2.2s infinite; }
-        @keyframes p { 0%{box-shadow:0 0 12px #34D399,0 0 24px rgba(52,211,153,.5)} 50%{box-shadow:0 0 18px #34D399,0 0 36px rgba(52,211,153,.8)} 100%{box-shadow:0 0 12px #34D399,0 0 24px rgba(52,211,153,.5)} }
-        .title { font-weight: 600; letter-spacing: .3px; opacity: .95; }
-        .right { display: flex; gap: 8px; }
-        .btn { display: inline-flex; align-items: center; gap: 8px; padding: 8px 12px; border-radius: 999px;
-          background: rgba(255,255,255,.06); border: 1px solid rgba(255,255,255,.12); color: #E6E8EE; cursor: pointer;
-          transition: transform .06s ease, background .2s ease, border-color .2s ease; }
-        .btn:hover { background: rgba(255,255,255,.1); border-color: rgba(255,255,255,.2); transform: translateY(-1px); }
-        .btn:active { transform: translateY(0) scale(.99); }
-        .btn.on { background: linear-gradient(90deg, rgba(125,211,252,.22), rgba(96,165,250,.22)); border-color: rgba(125,211,252,.4); }
-        .btn.off { background: rgba(255,255,255,.04); opacity: .9; }
-
-        .viz { position: relative; border-bottom: 1px solid rgba(255,255,255,.08); padding: 6px 8px; }
-        .state { position: absolute; right: 12px; top: 10px; font-size: 12px; opacity: .8;
-          padding: 4px 8px; border-radius: 999px; background: rgba(255,255,255,.06); border: 1px solid rgba(255,255,255,.12); }
-
-        .chat { display: grid; grid-template-rows: 1fr auto; height: 100%; }
-        .msgs { overflow-y: auto; padding: 10px 12px; display: flex; flex-direction: column; gap: 8px; }
-        .msg { max-width: 80%; padding: 10px 12px; border-radius: 12px; }
-        .msg.assistant { background: rgba(255,255,255,.06); border: 1px solid rgba(255,255,255,.08); }
-        .msg.user { margin-left: auto; background: rgba(125,211,252,.14); border: 1px solid rgba(125,211,252,.35); }
-        .composer { display: flex; gap: 8px; padding: 10px 12px; border-top: 1px solid rgba(255,255,255,.08); position: sticky; bottom: 0; background: rgba(11,15,25,.92); }
-        .composer input { flex: 1; border-radius: 12px; padding: 10px 12px; background: rgba(255,255,255,.04); border: 1px solid rgba(255,255,255,.12); color: #E6E8EE; outline: none; }
-        .composer input:focus { border-color: rgba(125,211,252,.55); box-shadow: 0 0 0 3px rgba(125,211,252,.15) inset; }
-        .send { padding: 10px 14px; border-radius: 12px; background: linear-gradient(90deg, rgba(125,211,252,.22), rgba(96,165,250,.22)); border: 1px solid rgba(125,211,252,.4); color: #E6E8EE; cursor: pointer; }
-        @media (max-width: 480px) { .wrap { grid-template-rows: 56px 140px 1fr; } .msg { max-width: 92%; } }
-      `}</style>
-    </div>
-  );
-}
+          box-shadow: 0 0 14px
