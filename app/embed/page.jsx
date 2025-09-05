@@ -322,4 +322,33 @@ export default function EmbedPage() {
         }
         .left { display: flex; align-items: center; gap: 10px; }
         .pulse { width: 12px; height: 12px; border-radius: 50%; background: #34D399;
-          box-shadow: 0 0 14px
+          box-shadow: 0 0 14px #34D399, 0 0 30px rgba(52,211,153,.6); animation: p 2.2s infinite; }
+        @keyframes p { 0%{box-shadow:0 0 12px #34D399,0 0 24px rgba(52,211,153,.5)} 50%{box-shadow:0 0 18px #34D399,0 0 36px rgba(52,211,153,.8)} 100%{box-shadow:0 0 12px #34D399,0 0 24px rgba(52,211,153,.5)} }
+        .title { font-weight: 600; letter-spacing: .3px; opacity: .95; }
+        .right { display: flex; gap: 8px; }
+        .btn { display: inline-flex; align-items: center; gap: 8px; padding: 8px 12px; border-radius: 999px;
+          background: rgba(255,255,255,.06); border: 1px solid rgba(255,255,255,.12); color: #E6E8EE; cursor: pointer;
+          transition: transform .06s ease, background .2s ease, border-color .2s ease; }
+        .btn:hover { background: rgba(255,255,255,.1); border-color: rgba(255,255,255,.2); transform: translateY(-1px); }
+        .btn:active { transform: translateY(0) scale(.99); }
+        .btn.on { background: linear-gradient(90deg, rgba(125,211,252,.22), rgba(96,165,250,.22)); border-color: rgba(125,211,252,.4); }
+        .btn.off { background: rgba(255,255,255,.04); opacity: .9; }
+
+        .viz { position: relative; border-bottom: 1px solid rgba(255,255,255,.08); padding: 6px 8px; }
+        .state { position: absolute; right: 12px; top: 10px; font-size: 12px; opacity: .8;
+          padding: 4px 8px; border-radius: 999px; background: rgba(255,255,255,.06); border: 1px solid rgba(255,255,255,.12); }
+
+        .chat { display: grid; grid-template-rows: 1fr auto; height: 100%; }
+        .msgs { overflow-y: auto; padding: 10px 12px; display: flex; flex-direction: column; gap: 8px; }
+        .msg { max-width: 80%; padding: 10px 12px; border-radius: 12px; }
+        .msg.assistant { background: rgba(255,255,255,.06); border: 1px solid rgba(255,255,255,.08); }
+        .msg.user { margin-left: auto; background: rgba(125,211,252,.14); border: 1px solid rgba(125,211,252,.35); }
+        .composer { display: flex; gap: 8px; padding: 10px 12px; border-top: 1px solid rgba(255,255,255,.08); position: sticky; bottom: 0; background: rgba(11,15,25,.92); }
+        .composer input { flex: 1; border-radius: 12px; padding: 10px 12px; background: rgba(255,255,255,.04); border: 1px solid rgba(255,255,255,.12); color: #E6E8EE; outline: none; }
+        .composer input:focus { border-color: rgba(125,211,252,.55); box-shadow: 0 0 0 3px rgba(125,211,252,.15) inset; }
+        .send { padding: 10px 14px; border-radius: 12px; background: linear-gradient(90deg, rgba(125,211,252,.22), rgba(96,165,250,.22)); border: 1px solid rgba(125,211,252,.4); color: #E6E8EE; cursor: pointer; }
+        @media (max-width: 480px) { .wrap { grid-template-rows: 56px 140px 1fr; } .msg { max-width: 92%; } }
+      `}</style>
+    </div>
+  );
+}
