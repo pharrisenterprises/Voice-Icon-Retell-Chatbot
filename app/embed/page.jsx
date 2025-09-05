@@ -1,208 +1,120 @@
 'use client';
 
-import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 
-function useSearch() {
-  // Safe client-only read of search params
-  const [q, setQ] = useState(null);
+// Canvas visualizer that reacts to either mic or playback (AudioNode)
+function Visualizer({ analyser }) {
+  const canvasRef = useRef(null);
+
   useEffect(() => {
-    try {
-      const sp = new URLSearchParams(window.location.search);
-      const obj = {};
-      sp.forEach((v, k) => (obj[k] = v));
-      setQ(obj);
-    } catch {}
-  }, []);
-  return q || {};
+    let raf = 0;
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+
+    const ctx = canvas.getContext('2d');
+    const bufLen = analyser?.frequencyBinCount || 0;
+    const data = new Uint8Array(bufLen);
+
+    function draw() {
+      raf = requestAnimationFrame(draw);
+      if (!analyser) {
+        // idle shimmer
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+        ctx.fillStyle = '#1f2937';
+        const barW = canvas.width / 32;
+        for (let i = 0; i < 32; i++) {
+          const h = 6 + 3 * Math.sin((Date.now() / 300) + i * 0.6);
+          const x = i * barW + barW * 0.2;
+          ctx.fillRect(x, canvas.height - h, barW * 0.6, h);
+        }
+        return;
+      }
+
+      analyser.getByteFrequencyData(data);
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      const bars = 40;
+      const step = Math.floor(data.length / bars);
+      const barW = canvas.width / bars;
+      for (let i = 0; i < bars; i++) {
+        const v = data[i * step] / 255; // 0..1
+        const h = Math.max(4, v * canvas.height * 0.9);
+        // gradient-ish
+        const g = ctx.createLinearGradient(0, canvas.height - h, 0, canvas.height);
+        g.addColorStop(0, '#6EE7F9');
+        g.addColorStop(1, '#4185F4');
+        ctx.fillStyle = g;
+        const x = i * barW + barW * 0.2;
+        ctx.fillRect(x, canvas.height - h, barW * 0.6, h);
+      }
+    }
+
+    draw();
+    return () => cancelAnimationFrame(raf);
+  }, [analyser]);
+
+  return (
+    <canvas
+      ref={canvasRef}
+      width={1200}
+      height={260}
+      style={{ width: '100%', height: '100%' }}
+      aria-hidden="true"
+    />
+  );
 }
 
 export default function EmbedPage() {
-  const search = useSearch();
-  const autostart = String(search.autostart || '0') === '1';
-
-  // UI state
-  const [status, setStatus] = useState('idle'); // idle | ready | listening | muted | error
+  // state
+  const [status, setStatus] = useState('idle'); // idle | ready | listening | speaking | error
   const [chatId, setChatId] = useState(null);
   const [messages, setMessages] = useState(() => [
-    { role: 'assistant', content: "Hi! I'm ready. You can speak, or type below." },
+    { role: 'assistant', content: "G'day! I'm Otto. Type below or click the mic to chat." },
   ]);
   const [input, setInput] = useState('');
   const [micOn, setMicOn] = useState(false);
   const [muted, setMuted] = useState(false);
-  const [audioUnlocked, setAudioUnlocked] = useState(false);
-  const [speaking, setSpeaking] = useState(false);
 
-  // refs
+  // audio graph
   const audioCtxRef = useRef(null);
   const gainRef = useRef(null);
-  const lastMsgRef = useRef(null);
-  const recognitionRef = useRef(null);
+  const analyserRef = useRef(null);
   const micStreamRef = useRef(null);
+  const micSourceRef = useRef(null);
 
-  // auto-scroll
-  useEffect(() => {
-    if (lastMsgRef.current) {
-      lastMsgRef.current.scrollIntoView({ block: 'end', behavior: 'smooth' });
-    }
-  }, [messages.length]);
+  // speech recognition
+  const recognitionRef = useRef(null);
 
-  // --- helpers
-  const ensureAudio = useCallback(async () => {
+  // transcript scrolling
+  const endRef = useRef(null);
+  useEffect(() => { endRef.current?.scrollIntoView({ behavior: 'smooth' }); }, [messages.length]);
+
+  // create audio context lazily on first user gesture (clicking mic or play)
+  const ensureAudioGraph = useCallback(async () => {
     if (!audioCtxRef.current) {
-      try {
-        const ctx = new (window.AudioContext || window.webkitAudioContext)();
-        const gain = ctx.createGain();
-        gain.gain.value = muted ? 0 : 1;
-        gain.connect(ctx.destination);
-        audioCtxRef.current = ctx;
-        gainRef.current = gain;
-      } catch (e) {
-        console.error('AudioContext error:', e);
-        setStatus('error');
-        return false;
-      }
+      const Ctx = window.AudioContext || window.webkitAudioContext;
+      const ctx = new Ctx();
+      const gain = ctx.createGain();
+      const analyser = ctx.createAnalyser();
+      analyser.fftSize = 1024;
+      analyser.smoothingTimeConstant = 0.85;
+      gain.gain.value = muted ? 0 : 1;
+      gain.connect(ctx.destination);
+      analyser.connect(gain);
+
+      audioCtxRef.current = ctx;
+      gainRef.current = gain;
+      analyserRef.current = analyser;
     }
     if (audioCtxRef.current.state !== 'running') {
-      try {
-        await audioCtxRef.current.resume();
-      } catch (e) {
-        // will require a user gesture
-        return false;
-      }
+      try { await audioCtxRef.current.resume(); } catch {}
     }
-    setAudioUnlocked(true);
-    return true;
+    return !!audioCtxRef.current;
   }, [muted]);
 
-  const requestMic = useCallback(async () => {
-    try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      micStreamRef.current = stream;
-      return true;
-    } catch (e) {
-      console.warn('Mic permission denied or failed:', e);
-      return false;
-    }
-  }, []);
-
-  const startRecognition = useCallback(() => {
-    const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
-    if (!SR) {
-      console.warn('Web Speech Recognition not supported in this browser.');
-      return false;
-    }
-    const rec = new SR();
-    rec.continuous = true;
-    rec.interimResults = true;
-    rec.lang = 'en-AU'; // prefer Aussie for user speech
-    rec.onstart = () => setStatus('listening');
-    rec.onend = () => {
-      // if mic still on, auto-restart (mobile can pause)
-      if (micOn) {
-        try { rec.start(); } catch {}
-      } else {
-        setStatus('ready');
-      }
-    };
-    rec.onerror = (ev) => {
-      console.warn('STT error:', ev?.error);
-      setStatus('error');
-    };
-    rec.onresult = (ev) => {
-      let finalText = '';
-      for (let i = ev.resultIndex; i < ev.results.length; i++) {
-        const res = ev.results[i];
-        if (res.isFinal) finalText += res[0].transcript;
-      }
-      if (finalText.trim()) {
-        append({ role: 'user', content: finalText.trim() });
-        sendToAgent(finalText.trim());
-      }
-    };
-    try {
-      rec.start();
-      recognitionRef.current = rec;
-      return true;
-    } catch (e) {
-      console.warn('rec.start failed:', e);
-      return false;
-    }
-  }, [micOn]);
-
-  const stopRecognition = useCallback(() => {
-    const rec = recognitionRef.current;
-    recognitionRef.current = null;
-    try { rec && rec.stop && rec.stop(); } catch {}
-    const s = micStreamRef.current;
-    micStreamRef.current = null;
-    if (s) {
-      try { s.getTracks().forEach(t => t.stop()); } catch {}
-    }
-  }, []);
-
-  const pickAussieVoice = useCallback(() => {
-    // Try to pick an AU male voice from Web Speech (as fallback when Azure isn't configured)
-    const voices = window.speechSynthesis?.getVoices?.() || [];
-    // best: en-AU and "male" hints in name
-    let v = voices.find(v => /en[-_]AU/i.test(v.lang) && /male|william|australi/i.test(v.name));
-    if (!v) v = voices.find(v => /en[-_]AU/i.test(v.lang));
-    if (!v) v = voices.find(v => /en[-_](GB|UK)/i.test(v.lang) && /male/i.test(v.name));
-    return v || voices[0] || null;
-  }, []);
-
-  const speak = useCallback(async (text) => {
-    if (!text) return;
-    // 1) Try Azure TTS via our API route (if not configured, it will 400 and we’ll fall back)
-    try {
-      const res = await fetch('/api/tts/speak', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ text }), // voice picked server-side env
-      });
-      if (res.ok && res.headers.get('Content-Type')?.includes('audio/')) {
-        const arrayBuffer = await res.arrayBuffer();
-        await ensureAudio();
-        const ctx = audioCtxRef.current;
-        const buffer = await ctx.decodeAudioData(arrayBuffer.slice(0));
-        setSpeaking(true);
-        const src = ctx.createBufferSource();
-        src.buffer = buffer;
-        src.connect(gainRef.current || ctx.destination);
-        src.onended = () => setSpeaking(false);
-        src.start(0);
-        return;
-      }
-    } catch (e) {
-      // swallow; we’ll fall back
-      console.warn('Azure TTS fetch failed, falling back to Web Speech:', e);
-    }
-
-    // 2) Fallback: Web Speech API voices
-    try {
-      await ensureAudio(); // unlocks AudioContext so browser will allow TTS
-      const utter = new SpeechSynthesisUtterance(text);
-      const voice = pickAussieVoice();
-      if (voice) utter.voice = voice;
-      utter.rate = 1.03;
-      utter.pitch = 1;
-      utter.onstart = () => setSpeaking(true);
-      utter.onend = () => setSpeaking(false);
-      // honor mute
-      if (muted) return; // silently skip speaking when muted
-      window.speechSynthesis.cancel(); // stop any prior
-      window.speechSynthesis.speak(utter);
-    } catch (e) {
-      console.warn('speechSynthesis failed:', e);
-    }
-  }, [ensureAudio, pickAussieVoice, muted]);
-
-  const append = useCallback((m) => {
-    setMessages((prev) => [...prev, m]);
-  }, []);
-
+  // start a Retell chat session (cheap text chat)
   const startChat = useCallback(async () => {
     try {
-      const r = await fetch('/api/retell-chat/start', { method: 'GET' });
+      const r = await fetch('/api/retell-chat/start');
       const j = await r.json();
       if (j?.ok && j?.chatId) {
         setChatId(j.chatId);
@@ -217,8 +129,63 @@ export default function EmbedPage() {
     }
   }, []);
 
+  // send text to agent → speak back
+  const speak = useCallback(async (text) => {
+    if (!text) return;
+
+    // Try Azure TTS
+    try {
+      await ensureAudioGraph();
+      const res = await fetch('/api/tts/speak', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text }),
+      });
+
+      if (res.ok && res.headers.get('Content-Type')?.includes('audio/')) {
+        const arr = await res.arrayBuffer();
+        const ctx = audioCtxRef.current;
+        const buffer = await ctx.decodeAudioData(arr.slice(0));
+        const src = ctx.createBufferSource();
+        src.buffer = buffer;
+        // visualizer hookup
+        if (analyserRef.current) src.connect(analyserRef.current);
+        src.connect(gainRef.current || ctx.destination);
+
+        setStatus('speaking');
+        src.onended = () => setStatus(micOn ? 'listening' : 'ready');
+        src.start(0);
+        return;
+      }
+    } catch (e) {
+      console.warn('Azure TTS failed, falling back to Web Speech:', e);
+    }
+
+    // Fallback: browser TTS (quick & simple)
+    try {
+      await ensureAudioGraph();
+      const u = new SpeechSynthesisUtterance(text);
+      // let browser pick en-AU if available
+      const pick = () => {
+        const vs = window.speechSynthesis.getVoices();
+        let v = vs.find(v => /en[-_]AU/i.test(v.lang) && /william|cooper|male|australi/i.test(v.name));
+        if (!v) v = vs.find(v => /en[-_]AU/i.test(v.lang));
+        return v || vs[0];
+      };
+      u.voice = pick();
+      u.rate = 1.15; // modest pep for fallback
+      u.onstart = () => setStatus('speaking');
+      u.onend = () => setStatus(micOn ? 'listening' : 'ready');
+      if (!muted) {
+        window.speechSynthesis.cancel();
+        window.speechSynthesis.speak(u);
+      }
+    } catch (e) {
+      console.warn('speechSynthesis error:', e);
+    }
+  }, [ensureAudioGraph, micOn, muted]);
+
   const sendToAgent = useCallback(async (text) => {
-    if (!text?.trim()) return;
     const cid = chatId || (await startChat());
     if (!cid) return;
 
@@ -230,143 +197,137 @@ export default function EmbedPage() {
       });
       const j = await r.json();
       if (j?.ok && j?.reply) {
-        append({ role: 'assistant', content: j.reply });
-        speak(j.reply);
+        setMessages(m => [...m, { role: 'assistant', content: j.reply }]);
+        if (!muted) speak(j.reply);
       } else {
-        append({ role: 'assistant', content: 'Hmm, something went wrong reaching the agent.' });
+        setMessages(m => [...m, { role: 'assistant', content: 'Hmm, I had trouble reaching the agent.' }]);
       }
-    } catch (e) {
-      append({ role: 'assistant', content: 'Network error. Please try again.' });
+    } catch {
+      setMessages(m => [...m, { role: 'assistant', content: 'Network hiccup—try again.' }]);
     }
-  }, [append, chatId, speak, startChat]);
+  }, [chatId, startChat, speak, muted]);
 
-  // mic toggle
+  // mic handling
+  const startRecognition = useCallback(() => {
+    const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+    if (!SR) {
+      setMessages(m => [...m, { role: 'assistant', content: 'This browser does not support speech recognition.' }]);
+      return false;
+    }
+    const rec = new SR();
+    rec.continuous = true;
+    rec.interimResults = true;
+    rec.lang = 'en-AU';
+    rec.onstart = () => setStatus('listening');
+    rec.onend = () => {
+      // if still micOn, resume (mobile may auto-stop)
+      if (micOn) {
+        try { rec.start(); } catch {}
+      } else {
+        setStatus('ready');
+      }
+    };
+    rec.onerror = () => setStatus('error');
+    rec.onresult = (ev) => {
+      let finalText = '';
+      for (let i = ev.resultIndex; i < ev.results.length; i++) {
+        const res = ev.results[i];
+        if (res.isFinal) finalText += res[0].transcript;
+      }
+      finalText = finalText.trim();
+      if (finalText) {
+        setMessages(m => [...m, { role: 'user', content: finalText }]);
+        sendToAgent(finalText);
+      }
+    };
+
+    try { rec.start(); recognitionRef.current = rec; return true; }
+    catch (e) { console.warn('rec.start failed', e); return false; }
+  }, [micOn, sendToAgent]);
+
+  const stopRecognition = useCallback(() => {
+    const r = recognitionRef.current;
+    recognitionRef.current = null;
+    try { r?.stop?.(); } catch {}
+  }, []);
+
   const toggleMic = useCallback(async () => {
     if (micOn) {
       setMicOn(false);
       stopRecognition();
+      // stop mic tracks & disconnect analyser input
+      try {
+        micSourceRef.current?.disconnect();
+        micSourceRef.current = null;
+      } catch {}
+      if (micStreamRef.current) {
+        micStreamRef.current.getTracks().forEach(t => t.stop());
+        micStreamRef.current = null;
+      }
       setStatus('ready');
       return;
     }
-    // turning ON
-    const okAudio = await ensureAudio();
-    if (!okAudio) {
-      // need a user gesture; overlay button will handle it
+    // turn ON
+    const okAudio = await ensureAudioGraph(); // user gesture
+    if (!okAudio) return;
+
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      micStreamRef.current = stream;
+      if (audioCtxRef.current && analyserRef.current) {
+        // hook mic to analyser for live bars
+        const src = audioCtxRef.current.createMediaStreamSource(stream);
+        micSourceRef.current = src;
+        src.connect(analyserRef.current);
+      }
+    } catch (e) {
+      setMessages(m => [...m, { role: 'assistant', content: 'Mic permission was blocked.' }]);
       return;
     }
-    const gotMic = await requestMic();
-    if (!gotMic) return;
-    const started = startRecognition();
-    if (started) {
+
+    if (!(await startChat())) return; // ensure we have a chat session
+    if (startRecognition()) {
       setMicOn(true);
-      if (!chatId) await startChat();
     }
-  }, [micOn, ensureAudio, requestMic, startRecognition, stopRecognition, chatId, startChat]);
+  }, [micOn, ensureAudioGraph, startChat, startRecognition, stopRecognition]);
 
   const toggleMute = useCallback(() => {
-    setMuted((m) => {
-      const next = !m;
-      if (gainRef.current) {
-        gainRef.current.gain.value = next ? 0 : 1;
-      }
+    setMuted(v => {
+      const next = !v;
+      if (gainRef.current) gainRef.current.gain.value = next ? 0 : 1;
       return next;
     });
   }, []);
 
-  const doRestart = useCallback(async () => {
-    stopRecognition();
-    setMicOn(false);
-    setMessages([{ role: 'assistant', content: "Fresh start. I'm listening." }]);
-    setChatId(null);
-    const cid = await startChat();
-    // auto-start mic again if audio is unlocked
-    if (audioUnlocked && cid) {
-      await toggleMic();
-    }
-  }, [audioUnlocked, startChat, stopRecognition, toggleMic]);
+  const onSubmit = useCallback(async (e) => {
+    e.preventDefault();
+    const t = input.trim();
+    if (!t) return;
+    setMessages(m => [...m, { role: 'user', content: t }]);
+    setInput('');
+    await sendToAgent(t);
+  }, [input, sendToAgent]);
 
-  // autostart flow
-  useEffect(() => {
-    if (!autostart) return;
-    (async () => {
-      await startChat();
-      // try to unlock audio & start mic immediately
-      const okAudio = await ensureAudio();
-      const gotMic = await requestMic();
-      if (okAudio && gotMic) {
-        startRecognition();
-        setMicOn(true);
-      }
-    })();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [autostart]);
-
-  // overlay click handler: guarantees audio unlock + mic prompt + start
-  const handleEnableAudio = useCallback(async () => {
-    const okAudio = await ensureAudio();
-    const gotMic = await requestMic();
-    if (okAudio && gotMic) {
-      startRecognition();
-      setMicOn(true);
-      if (!chatId) await startChat();
-    }
-  }, [chatId, ensureAudio, requestMic, startChat, startRecognition]);
-
-  const onSubmit = useCallback(
-    async (e) => {
-      e.preventDefault();
-      const t = input.trim();
-      if (!t) return;
-      append({ role: 'user', content: t });
-      setInput('');
-      await sendToAgent(t);
-    },
-    [input, append, sendToAgent]
-  );
-
-  const needEnableOverlay = useMemo(() => {
-    // show overlay if audio context isn't running yet
-    return !audioUnlocked;
-  }, [audioUnlocked]);
+  // Initialize a chat silently on load (for fast first reply); mic stays OFF.
+  useEffect(() => { startChat(); }, [startChat]);
 
   return (
     <div className="h-screen w-screen bg-[#0B0F19] text-[#E6E8EE] flex flex-col">
-      {/* Top: visualizer placeholder */}
+      {/* Top half: waveform */}
       <div className="flex-1 relative border-b border-white/10">
-        <div className="absolute inset-0 flex items-center justify-center">
-          {/* simple equalizer bars that animate while speaking or listening */}
-          <div className="flex gap-2">
-            {[0,1,2,3].map(i => (
-              <div key={i}
-                   className="w-2 rounded bg-gradient-to-b from-[#6EE7F9] to-[#4185F4]"
-                   style={{
-                     height: speaking ? `${30 + 20*Math.sin((Date.now()/120)+(i*0.9))}px` : (status==='listening' ? '28px' : '6px'),
-                     transition: 'height 120ms linear'
-                   }}/>
-            ))}
-          </div>
-        </div>
-
-        {/* Enable audio overlay */}
-        {needEnableOverlay && (
-          <div className="absolute inset-0 bg-black/60 backdrop-blur-sm flex items-center justify-center">
-            <button
-              onClick={handleEnableAudio}
-              className="px-4 py-2 rounded bg-white/10 hover:bg-white/20 border border-white/20"
-              title="Enable audio"
-              aria-label="Enable audio"
-            >
-              Tap to enable audio
-            </button>
-          </div>
-        )}
+        <Visualizer analyser={analyserRef.current} />
       </div>
 
-      {/* Bottom: chat */}
+      {/* Bottom half: chat + controls */}
       <div className="flex-[1] min-h-[50%] max-h-[50%] flex flex-col">
         {/* Controls */}
         <div className="flex items-center gap-2 p-3 border-b border-white/10">
-          <span className="text-xs opacity-80">{status === 'listening' ? 'Listening' : status === 'ready' ? 'Ready' : status}</span>
+          <span className="text-xs opacity-80">
+            {status === 'speaking' ? 'Otto is speaking' :
+             status === 'listening' ? 'Listening…' :
+             status === 'ready' ? 'Ready' :
+             status}
+          </span>
           <div className="ml-auto flex items-center gap-2">
             <button
               onClick={toggleMic}
@@ -378,31 +339,23 @@ export default function EmbedPage() {
             </button>
             <button
               onClick={toggleMute}
-              title={muted ? 'Unmute output' : 'Mute output'}
+              title={muted ? 'Unmute' : 'Mute output'}
               aria-label="Mute output"
               className="px-3 py-2 rounded border border-white/20 text-sm hover:bg-white/10"
             >
               🔈 {muted ? 'Off' : 'On'}
-            </button>
-            <button
-              onClick={doRestart}
-              title="Restart conversation"
-              aria-label="Restart"
-              className="px-3 py-2 rounded border border-white/20 text-sm hover:bg-white/10"
-            >
-              ⟳
             </button>
           </div>
         </div>
 
         {/* transcript */}
         <div className="flex-1 overflow-y-auto p-3 space-y-2">
-          {messages.map((m, idx) => (
-            <div key={idx} className={`max-w-[80%] px-3 py-2 rounded ${m.role==='user'?'ml-auto bg-white/10':'bg-white/5'}`}>
+          {messages.map((m, i) => (
+            <div key={i} className={`max-w-[80%] px-3 py-2 rounded ${m.role==='user'?'ml-auto bg-white/10':'bg-white/5'}`}>
               {m.content}
             </div>
           ))}
-          <div ref={lastMsgRef} />
+          <div ref={endRef} />
         </div>
 
         {/* input */}
