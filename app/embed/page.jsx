@@ -1,531 +1,659 @@
+// app/embed/page.jsx
 'use client';
 
-import React, { useCallback, useEffect, useRef, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 
-/* ================= Neon visualizer (output only — no loopback) ================= */
-function Visualizer({ analyser }) {
-  const canvasRef = useRef(null);
+/**
+ * Voice-only widget (Retell text routes + client ASR + TTS).
+ * - Self-talk protection (half-duplex): pause ASR while speaking + guard tail.
+ * - 60s idle -> mic auto-off with "Turn Mic On to Speak".
+ * - Azure TTS (public envs) or Web Speech fallback.
+ * - Mic echoCancellation on getUserMedia prompt.
+ * - Auto-scroll chat; responsive dark UI.
+ *
+ * Required API routes (already in repo):
+ *   GET  /api/retell-chat/start -> { ok, chatId }
+ *   POST /api/retell-chat/send  -> { ok, reply }
+ */
+
+// ----------------------------- Tunables ---------------------------------
+
+const INITIAL_MIC_ON = true;              // Attempt to start listening on open
+const INITIAL_SOUND_ON = true;            // TTS on by default
+const IDLE_TIMEOUT_MS = 60_000;           // 60s idle -> mic OFF
+const AUTO_SCROLL_DEBOUNCE = 30;          // ms
+
+// Self-talk protection (half-duplex)
+const ECHO_GUARD_BEFORE_MS = 150;         // short lead before TTS starts
+const ECHO_GUARD_AFTER_MS  = 1200;        // tail guard after TTS finishes
+const LISTEN_RESUME_DELAY_MS = 250;       // small delay before restarting ASR
+
+// Mic restart backoff for webkitSpeechRecognition
+const RESTART_BACKOFF_MS = 180;
+
+// Azure TTS tuning (only used when NEXT_PUBLIC_ envs are present)
+const AZURE_RATE = 'medium';              // 'x-slow'|'slow'|'medium'|'fast'|'x-fast' or percentage
+const AZURE_PITCH = '+8%';                // e.g. '+8%' '-2st'
+const AZURE_STYLE = 'cheerful';           // 'cheerful'|'newscast-casual'|etc.
+
+// ----------------------------- Helpers ----------------------------------
+
+function now() { return Date.now(); }
+
+function cls(...a) { return a.filter(Boolean).join(' '); }
+
+function useAutoScroll(depKey) {
+  const listRef = useRef(null);
   useEffect(() => {
-    const cvs = canvasRef.current;
-    if (!cvs) return;
-    const ctx = cvs.getContext('2d');
-    const BARS = 44;
-    const fft = new Uint8Array(1024);
-    let raf = 0;
-
-    function bar(x, y, w, h, glow) {
-      const g = ctx.createLinearGradient(0, y - h, 0, y);
-      g.addColorStop(0, '#7DD3FC');
-      g.addColorStop(1, '#60A5FA');
-      ctx.fillStyle = g;
-      ctx.shadowColor = '#60A5FA';
-      ctx.shadowBlur = 16 * glow;
-      ctx.fillRect(x, y - h, w, h);
-      ctx.shadowBlur = 0;
-    }
-    function idle() {
-      ctx.clearRect(0, 0, cvs.width, cvs.height);
-      const w = cvs.width / BARS;
-      for (let i = 0; i < BARS; i++) {
-        const h = 6 + 4 * Math.sin((Date.now() / 360) + i * 0.55);
-        bar(i * w + w * 0.25, cvs.height, w * 0.5, h, 0.35);
-      }
-    }
-    function loop() {
-      raf = requestAnimationFrame(loop);
-      if (!analyser) return idle();
-      analyser.getByteFrequencyData(fft);
-      ctx.clearRect(0, 0, cvs.width, cvs.height);
-      const step = Math.max(1, Math.floor(analyser.frequencyBinCount / BARS));
-      const w = cvs.width / BARS;
-      for (let i = 0; i < BARS; i++) {
-        const v = fft[i * step] / 255;
-        const h = Math.max(6, v * cvs.height * 0.9);
-        bar(i * w + w * 0.25, cvs.height, w * 0.5, h, 0.7 + v * 0.7);
-      }
-    }
-    loop();
-    return () => cancelAnimationFrame(raf);
-  }, [analyser]);
-
-  return <canvas ref={canvasRef} width={1400} height={260} style={{ width: '100%', height: '100%' }} aria-hidden="true" />;
+    const el = listRef.current;
+    if (!el) return;
+    const t = setTimeout(() => { el.scrollTop = el.scrollHeight; }, AUTO_SCROLL_DEBOUNCE);
+    return () => clearTimeout(t);
+  }, [depKey]);
+  return listRef;
 }
 
-/* =============================== Embed page =============================== */
+// ----------------------------- Component --------------------------------
+
 export default function EmbedPage() {
-  /* ---------- UI state ---------- */
-  const [muted, setMuted] = useState(false);
-  const [micOn, setMicOn] = useState(false);
-  const [status, setStatus] = useState('mic-off'); // listening | speaking | mic-off | error
-  const [statusNote, setStatusNote] = useState('');
-  const [needsAudioUnlock, setNeedsAudioUnlock] = useState(false);
-  const [autoStopped, setAutoStopped] = useState(false); // to change pill text after auto-idle
-
-  /* ---------- Chat state ---------- */
+  // Controls
+  const [micOn, setMicOn] = useState(INITIAL_MIC_ON);
+  const [soundOn, setSoundOn] = useState(INITIAL_SOUND_ON);
+  const [status, setStatus] = useState(''); // 'Listening' | 'Speaking' | '' or pill text when off
   const [chatId, setChatId] = useState(null);
-  const [messages, setMessages] = useState([
-    { role: 'assistant', content: "G'day! I'm Otto 👋  Type below or tap the mic to talk." },
+
+  // Chat messages
+  const [messages, setMessages] = useState(() => [
+    { role: 'assistant', content: "G’day! I’m Otto 👋  Type below or tap the mic to talk." }
   ]);
-  const [input, setInput] = useState('');
-  const endRef = useRef(null);
-  useEffect(() => { endRef.current?.scrollIntoView({ behavior: 'smooth' }); }, [messages.length]);
+  const listRef = useAutoScroll(messages.length);
 
-  /* ---------- Audio OUT graph ---------- */
+  // Audio + ASR refs
+  const audioElRef = useRef(null);
   const audioCtxRef = useRef(null);
-  const gainRef = useRef(null);
-  const analyserRef = useRef(null);
-  const ttsSourceRef = useRef(null);
+  const analyzerRef = useRef(null);
+  const animRef = useRef(0);
 
-  /* ---------- Speech runtime ---------- */
-  const recognitionRef = useRef(null);
-  const SR = typeof window !== 'undefined' ? (window.SpeechRecognition || window.webkitSpeechRecognition) : null;
-
-  const recActiveRef = useRef(false);
+  const recognizerRef = useRef(null);
+  const wantListeningRef = useRef(INITIAL_MIC_ON);   // “user wants mic on?”
   const speakingRef = useRef(false);
+  const speakGuardUntilRef = useRef(0);
 
-  // Activity bookkeeping (used for auto-idle)
-  const lastActivityRef = useRef(Date.now()); // updated on speech in/out + text send
-  const INACTIVITY_MS = 60 * 1000; // 1 minute of true silence before we toggle mic off
+  // Idle logic
+  const lastActivityRef = useRef(now());
+  const idleTimerRef = useRef(0);
 
-  // Chrome sometimes stalls recognition; we "soft" restart if no events for a while
-  const recIdleTimerRef = useRef(null);
-  const clearRecIdle = () => { if (recIdleTimerRef.current) { clearTimeout(recIdleTimerRef.current); recIdleTimerRef.current = null; } };
-  const armRecIdle = () => {
-    clearRecIdle();
-    recIdleTimerRef.current = setTimeout(() => {
-      if (!micOn || speakingRef.current) return;
-      try { recognitionRef.current?.stop?.(); } catch {}
-      setTimeout(() => { if (micOn && !speakingRef.current) startRecognition(true); }, 250);
-    }, 30000);
-  };
+  // UI state for the waveform stripes animation
+  const [speaking, setSpeaking] = useState(false);
 
-  // Keep pill/button in sync by deriving from a single truth
-  const syncStatus = useCallback((explicit) => {
-    if (explicit) { setStatus(explicit); return; }
-    if (speakingRef.current) setStatus('speaking');
-    else if (micOn) setStatus('listening');
-    else setStatus('mic-off');
-  }, [micOn]);
-
-  /* ---------- Audio graph ---------- */
-  const ensureAudioGraph = useCallback(async () => {
-    if (!audioCtxRef.current) {
-      const Ctx = window.AudioContext || window.webkitAudioContext;
-      const ctx = new Ctx();
-      const gain = ctx.createGain();
-      const analyser = ctx.createAnalyser();
-      analyser.fftSize = 1024;
-      analyser.smoothingTimeConstant = 0.86;
-      analyser.connect(gain);
-      gain.connect(ctx.destination);
-      gain.gain.value = muted ? 0 : 1;
-      audioCtxRef.current = ctx;
-      gainRef.current = gain;
-      analyserRef.current = analyser;
-    }
-    try {
-      if (audioCtxRef.current.state !== 'running') await audioCtxRef.current.resume();
-      setNeedsAudioUnlock(false);
-    } catch {
-      setNeedsAudioUnlock(true);
-    }
-  }, [muted]);
-
-  /* ---------- Server chat routes ---------- */
-  const startChat = useCallback(async () => {
-    try {
-      const r = await fetch('/api/retell-chat/start', { cache: 'no-store' });
-      const j = await r.json();
-      if (j?.ok && j?.chatId) { setChatId(j.chatId); return j.chatId; }
-    } catch {}
-    setStatus('error');
-    return null;
+  const AZURE = useMemo(() => {
+    const key = process.env.NEXT_PUBLIC_AZURE_SPEECH_KEY || '';
+    const region = process.env.NEXT_PUBLIC_AZURE_SPEECH_REGION || '';
+    const voice = process.env.NEXT_PUBLIC_AZURE_TTS_VOICE || 'en-AU-WilliamNeural';
+    return key && region ? { key, region, voice } : null;
   }, []);
 
-  const sendToAgent = useCallback(async (text) => {
-    const cid = chatId || (await startChat());
-    if (!cid) return;
-    lastActivityRef.current = Date.now();
+  // Token cache for Azure
+  const azureTokenRef = useRef({ token: null, exp: 0 });
+
+  // ----------------------- Lifecycle: mount/init -------------------------
+
+  useEffect(() => {
+    // Read autostart param (defaults to 1 as set by embed.js)
+    let auto = true;
+    try {
+      const u = new URL(window.location.href);
+      auto = (u.searchParams.get('autostart') ?? '1') !== '0';
+    } catch {}
+    if (!auto) {
+      wantListeningRef.current = false;
+      setMicOn(false);
+      setStatus('Turn Mic On to Speak');
+    }
+
+    // Start chat
+    (async () => {
+      try {
+        const r = await fetch('/api/retell-chat/start', { cache: 'no-store' });
+        const j = await r.json().catch(() => ({}));
+        if (j?.ok && j.chatId) setChatId(j.chatId);
+      } catch {}
+    })();
+
+    // Prepare AudioContext lazily; will also feed the waveform
+    const audio = new Audio();
+    audioElRef.current = audio;
+    // unlock AudioContext on first user gesture
+    const unlock = () => {
+      if (!audioCtxRef.current) {
+        try {
+          const ctx = new (window.AudioContext || window.webkitAudioContext)();
+          audioCtxRef.current = ctx;
+          const src = ctx.createMediaElementSource(audio);
+          const analyser = ctx.createAnalyser();
+          analyser.fftSize = 256;
+          src.connect(analyser);
+          analyser.connect(ctx.destination);
+          analyzerRef.current = analyser;
+        } catch {}
+      } else {
+        audioCtxRef.current.resume().catch(() => {});
+      }
+      window.removeEventListener('pointerdown', unlock);
+      window.removeEventListener('keydown', unlock);
+    };
+    window.addEventListener('pointerdown', unlock, { once: true });
+    window.addEventListener('keydown', unlock, { once: true });
+
+    // Kick off mic if autostart
+    if (auto) {
+      ensureMicPermission();   // prompts and warms up OS echo cancellation
+      setTimeout(() => startRecognition(true), 50);
+    }
+
+    // Clean up
+    return () => {
+      stopRecognition('unmount');
+      cancelAnimationFrame(animRef.current || 0);
+      try { audio.pause(); } catch {}
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // ---------------------------- Mic / ASR --------------------------------
+
+  async function ensureMicPermission() {
+    // This prompts mic and enables device-level echoCancellation
+    try {
+      await navigator.mediaDevices.getUserMedia({
+        audio: {
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true,
+          channelCount: 1,
+          sampleRate: 48000
+        }
+      });
+    } catch (e) {
+      console.warn('Mic permission denied or unavailable', e);
+    }
+  }
+
+  function armIdleTimer() {
+    clearTimeout(idleTimerRef.current);
+    idleTimerRef.current = setTimeout(() => {
+      // 60s idle → mic off
+      wantListeningRef.current = false;
+      setMicOn(false);
+      stopRecognition('idle');
+      setStatus('Turn Mic On to Speak');
+    }, IDLE_TIMEOUT_MS);
+  }
+
+  function bumpActivity() {
+    lastActivityRef.current = now();
+    armIdleTimer();
+  }
+
+  function createRecognizer() {
+    // Safari/Chrome webkitSpeechRecognition
+    // eslint-disable-next-line no-undef
+    const R = new window.webkitSpeechRecognition();
+    R.continuous = true;
+    R.interimResults = false;
+    R.lang = 'en-US';
+
+    R.onstart = () => {
+      setStatus('Listening');
+    };
+
+    R.onend = () => {
+      // If user still wants mic and we aren't speaking, restart shortly
+      if (wantListeningRef.current && !speakingRef.current) {
+        setTimeout(() => {
+          try { R.start(); } catch {}
+        }, RESTART_BACKOFF_MS);
+      } else {
+        // ended because user toggled off or we're speaking
+        if (!wantListeningRef.current) setStatus('Turn Mic On to Speak');
+        else setStatus(''); // speaking or paused
+      }
+    };
+
+    R.onerror = () => {
+      // Soft restart path
+      if (wantListeningRef.current && !speakingRef.current) {
+        setTimeout(() => {
+          try { R.start(); } catch {}
+        }, 400);
+      }
+    };
+
+    R.onresult = (e) => {
+      // Drop anything during or shortly after TTS (echo/self-talk guard)
+      if (now() < speakGuardUntilRef.current || speakingRef.current) return;
+
+      let t = '';
+      for (let i = e.resultIndex; i < e.results.length; i++) {
+        const res = e.results[i];
+        if (res.isFinal) t += (res[0]?.transcript || '');
+      }
+      t = (t || '').trim();
+      if (!t) return;
+
+      handleUserTranscript(t);
+    };
+
+    return R;
+  }
+
+  function startRecognition(fromUserToggle = false) {
+    wantListeningRef.current = true;
+    setMicOn(true);
+    setStatus('Listening');
+
+    if (!recognizerRef.current) {
+      if (!('webkitSpeechRecognition' in window)) {
+        // Browser cannot do ASR; leave mic pill OFF
+        setMicOn(false);
+        wantListeningRef.current = false;
+        setStatus('Mic not supported');
+        return;
+      }
+      recognizerRef.current = createRecognizer();
+    }
+    try { recognizerRef.current.start(); } catch {}
+    if (fromUserToggle) bumpActivity();
+  }
+
+  function stopRecognition(_reason = '') {
+    try { recognizerRef.current?.stop(); } catch {}
+  }
+
+  // ----------------------------- TTS -------------------------------------
+
+  async function getAzureToken() {
+    if (!AZURE) return null;
+    const cached = azureTokenRef.current;
+    if (cached.token && cached.exp > now() + 10_000) return cached.token;
+    // fetch a new token
+    const url = `https://${AZURE.region}.api.cognitive.microsoft.com/sts/v1.0/issueToken`;
+    const r = await fetch(url, {
+      method: 'POST',
+      headers: { 'Ocp-Apim-Subscription-Key': AZURE.key }
+    });
+    if (!r.ok) throw new Error('Azure token failed');
+    const token = await r.text();
+    azureTokenRef.current = { token, exp: now() + 9 * 60 * 1000 };
+    return token;
+  }
+
+  function buildSSML(text) {
+    const esc = (s) => s
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;');
+    return `<?xml version="1.0"?>
+<speak version="1.0" xml:lang="en-US">
+  <voice name="${AZURE?.voice || 'en-AU-WilliamNeural'}">
+    <prosody rate="${AZURE_RATE}" pitch="${AZURE_PITCH}">
+      <mstts:express-as xmlns:mstts="https://www.w3.org/2001/mstts" style="${AZURE_STYLE}">
+        ${esc(text)}
+      </mstts:express-as>
+    </prosody>
+  </voice>
+</speak>`;
+  }
+
+  async function playAzureTTS(text) {
+    if (!AZURE) return playWebSpeech(text);
+
+    const token = await getAzureToken();
+    const ttsUrl = `https://${AZURE.region}.tts.speech.microsoft.com/cognitiveservices/v1`;
+    const r = await fetch(ttsUrl, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${token}`,
+        'Content-Type': 'application/ssml+xml',
+        'X-Microsoft-OutputFormat': 'audio-24khz-48kbitrate-mono-mp3'
+      },
+      body: buildSSML(text)
+    });
+    if (!r.ok) throw new Error('Azure TTS failed');
+
+    const buf = await r.arrayBuffer();
+    const blob = new Blob([buf], { type: 'audio/mpeg' });
+    const url = URL.createObjectURL(blob);
+
+    const audio = audioElRef.current;
+    return new Promise((resolve) => {
+      try {
+        audio.onended = () => { URL.revokeObjectURL(url); resolve(); };
+        audio.onerror = () => { URL.revokeObjectURL(url); resolve(); };
+        audio.src = url;
+        audio.play().catch(() => resolve());
+      } catch { resolve(); }
+    });
+  }
+
+  function playWebSpeech(text) {
+    return new Promise((resolve) => {
+      if (!('speechSynthesis' in window)) return resolve();
+      const u = new SpeechSynthesisUtterance(text);
+      u.rate = 1.15;
+      u.pitch = 1.08;
+      u.onend = resolve;
+      u.onerror = resolve;
+      window.speechSynthesis.cancel();
+      window.speechSynthesis.speak(u);
+    });
+  }
+
+  async function speakText(text) {
+    if (!text) return;
+    // Pause mic + guard the tail to avoid self-talk
+    speakingRef.current = true;
+    setSpeaking(true);
+    setStatus('Speaking');
+    stopRecognition('tts');
+    speakGuardUntilRef.current = now() + ECHO_GUARD_BEFORE_MS;
+
+    const after = () => {
+      // extend guard past the end of audio
+      speakGuardUntilRef.current = now() + ECHO_GUARD_AFTER_MS;
+      speakingRef.current = false;
+      setSpeaking(false);
+      // Resume mic if user wants it
+      if (wantListeningRef.current) {
+        setTimeout(() => startRecognition(false), LISTEN_RESUME_DELAY_MS);
+      } else {
+        setStatus('Turn Mic On to Speak');
+      }
+    };
+
+    try {
+      if (soundOn) {
+        await playAzureTTS(text);
+      } else {
+        // sound is muted → no audio, but still respect guard timing minimally
+        await new Promise((r) => setTimeout(r, 200));
+      }
+    } catch {
+      // swallow TTS errors but keep flow
+    } finally {
+      after();
+    }
+  }
+
+  // ---------------------------- Chat flow --------------------------------
+
+  async function sendToAgent(text) {
+    if (!text) return '';
     try {
       const r = await fetch('/api/retell-chat/send', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ chatId: cid, content: text }),
+        body: JSON.stringify({ chatId, content: text })
       });
-      const j = await r.json();
-      if (j?.ok && j?.reply) {
-        lastActivityRef.current = Date.now();
-        setMessages(m => [...m, { role: 'assistant', content: j.reply }]);
-        if (!muted) await speak(j.reply);
-      } else {
-        setMessages(m => [...m, { role: 'assistant', content: 'I had trouble reaching the agent just now.' }]);
-      }
-    } catch {
-      setMessages(m => [...m, { role: 'assistant', content: 'Network hiccup—try again.' }]);
-    }
-  }, [chatId, startChat, muted]);
-
-  /* ---------- TTS (Azure first, SpeechSynthesis fallback) ---------- */
-  const speak = useCallback(async (text) => {
-    if (!text) return;
-
-    speakingRef.current = true;
-    syncStatus(); // speaking
-    try { ttsSourceRef.current?.stop?.(0); } catch {}
-
-    // Azure
-    try {
-      await ensureAudioGraph();
-      const res = await fetch('/api/tts/speak', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ text }),
-      });
-      if (res.ok && res.headers.get('Content-Type')?.includes('audio/')) {
-        const buf = await res.arrayBuffer();
-        const ctx = audioCtxRef.current;
-        const audioBuf = await ctx.decodeAudioData(buf.slice(0));
-        const src = ctx.createBufferSource();
-        src.buffer = audioBuf;
-        if (analyserRef.current) src.connect(analyserRef.current);
-        src.connect(gainRef.current || ctx.destination);
-        lastActivityRef.current = Date.now();
-        src.onended = () => {
-          speakingRef.current = false;
-          lastActivityRef.current = Date.now();
-          syncStatus(); // back to listening if mic is on
-          if (micOn) safeRestartRecognition();
-        };
-        src.start(0);
-        ttsSourceRef.current = src;
-        return;
-      }
+      const j = await r.json().catch(() => ({}));
+      if (j?.ok && typeof j.reply === 'string') return j.reply;
     } catch {}
+    return "Sorry—I'm having trouble right now.";
+  }
 
-    // Fallback
-    try {
-      await ensureAudioGraph();
-      window.speechSynthesis.cancel();
-      const u = new SpeechSynthesisUtterance(text);
-      const pick = () => {
-        const vs = window.speechSynthesis.getVoices();
-        let v = vs.find(v => /en[-_]AU/i.test(v.lang) && /(william|cooper|male|australi)/i.test(v.name));
-        if (!v) v = vs.find(v => /en[-_]AU/i.test(v.lang));
-        return v || vs[0];
-      };
-      u.voice = pick();
-      u.rate = 1.15; u.pitch = 1.08;
-      u.onstart = () => { lastActivityRef.current = Date.now(); speakingRef.current = true; syncStatus(); };
-      u.onend = () => { speakingRef.current = false; lastActivityRef.current = Date.now(); syncStatus(); if (micOn) safeRestartRecognition(); };
-      if (!muted) window.speechSynthesis.speak(u);
-    } catch {}
-  }, [ensureAudioGraph, micOn, muted, syncStatus]);
-
-  /* ---------- Recognition ---------- */
-  const startRecognition = useCallback((soft = false) => {
-    if (!SR) {
-      setMessages(m => [...m, { role: 'assistant', content: 'This browser does not support voice input.' }]);
-      setStatus('error');
-      return false;
-    }
-    try { recognitionRef.current?.stop?.(); } catch {}
-
-    const rec = new SR();
-    rec.continuous = true;
-    rec.interimResults = false;
-    rec.lang = 'en-AU';
-
-    rec.onstart = () => {
-      recActiveRef.current = true;
-      lastActivityRef.current = Date.now();
-      setAutoStopped(false);
-      setStatusNote('');
-      syncStatus();      // listening
-      armRecIdle();
-    };
-    rec.onspeechstart = armRecIdle;
-    rec.onaudiostart = armRecIdle;
-    rec.onsoundstart = armRecIdle;
-
-    rec.onresult = (e) => {
-      armRecIdle();
-      lastActivityRef.current = Date.now();
-      if (speakingRef.current) return;
-      for (let i = e.resultIndex; i < e.results.length; i++) {
-        const r = e.results[i];
-        if (r.isFinal) {
-          const text = (r[0] && r[0].transcript) ? r[0].transcript.trim() : '';
-          if (!text) continue;
-          setMessages(m => [...m, { role: 'user', content: text }]);
-          sendToAgent(text);
-        }
-      }
-    };
-
-    rec.onerror = () => {
-      recActiveRef.current = false;
-      clearRecIdle();
-      // Keep mic ON — just rearm recognition (Chrome quirk)
-      if (micOn && !speakingRef.current) setTimeout(() => startRecognition(true), 300);
-    };
-    rec.onend = () => {
-      recActiveRef.current = false;
-      clearRecIdle();
-      if (micOn && !speakingRef.current) {
-        // Continuous re-arm to keep listening
-        setTimeout(() => startRecognition(true), 150);
-      }
-    };
-
-    try { rec.start(); } catch {}
-    recognitionRef.current = rec;
-    return true;
-  }, [SR, micOn, sendToAgent, syncStatus]);
-
-  const safeRestartRecognition = useCallback(() => {
-    try { recognitionRef.current?.stop?.(); } catch {}
-    setTimeout(() => { if (micOn) startRecognition(true); }, 120);
-  }, [micOn, startRecognition]);
-
-  /* ---------- Mic lifecycle ---------- */
-  const startMic = useCallback(async () => {
-    try {
-      await ensureAudioGraph();
-      await navigator.mediaDevices.getUserMedia({ audio: true });
-      setMicOn(true);
-      setAutoStopped(false);
-      setStatusNote('');
-      lastActivityRef.current = Date.now();
-      syncStatus(); // listening
-      startRecognition();
-      return true;
-    } catch {
-      setMicOn(false);
-      syncStatus(); // mic-off
-      setStatusNote('Please allow microphone access to talk.');
-      return false;
-    }
-  }, [ensureAudioGraph, startRecognition, syncStatus]);
-
-  const stopMic = useCallback((auto = false) => {
-    try { recognitionRef.current?.stop?.(); } catch {}
-    recActiveRef.current = false;
-    clearRecIdle();
-    setMicOn(false);
-    setAutoStopped(!!auto);
-    if (auto) setStatusNote(''); // message will be in pill text
-    syncStatus(); // mic-off
-  }, [syncStatus]);
-
-  /* ---------- Auto-idle watchdog (1 min of true silence) ---------- */
-  useEffect(() => {
-    if (!micOn) return;
-    const iv = setInterval(() => {
-      if (!micOn) return;
-      if (speakingRef.current) { lastActivityRef.current = Date.now(); return; }
-      const idleFor = Date.now() - lastActivityRef.current;
-      if (idleFor >= INACTIVITY_MS) {
-        stopMic(true); // auto-stop → pill shows instruction
-      }
-    }, 1000);
-    return () => clearInterval(iv);
-  }, [micOn, stopMic]);
-
-  /* ---------- Audio toggle ---------- */
-  const handleToggleMute = useCallback(async () => {
-    const next = !muted; setMuted(next);
-    await ensureAudioGraph();
-    if (gainRef.current) gainRef.current.gain.value = next ? 0 : 1;
-  }, [muted, ensureAudioGraph]);
-
-  const handleToggleMic = useCallback(async () => {
-    if (micOn) stopMic(false);
-    else await startMic();
-  }, [micOn, startMic, stopMic]);
-
-  const handleRestart = useCallback(async () => {
-    stopMic(false);
-    setMessages([{ role: 'assistant', content: "Let's start fresh—what would you like to do?" }]);
-    setChatId(null);
-    const cid = await startChat();
-    if (cid) await startMic();
-  }, [startChat, startMic, stopMic]);
-
-  /* ---------- embed.js open/close ---------- */
-  useEffect(() => {
-    function onMsg(e) {
-      const t = e?.data?.type;
-      if (t === 'avatar-widget:open') {
-        const params = new URLSearchParams(window.location.search);
-        if (params.get('autostart') === '1') {
-          (async () => { await ensureAudioGraph(); await startChat(); await startMic(); })();
-        }
-      } else if (t === 'avatar-widget:close') {
-        stopMic(false);
-        try { ttsSourceRef.current?.stop?.(0); } catch {}
-        window.speechSynthesis?.cancel?.();
-      }
-    }
-    window.addEventListener('message', onMsg);
-    return () => window.removeEventListener('message', onMsg);
-  }, [ensureAudioGraph, startChat, startMic, stopMic]);
-
-  // Direct nav autostart
-  useEffect(() => {
-    const params = new URLSearchParams(window.location.search);
-    if (params.get('autostart') === '1') {
-      (async () => { await ensureAudioGraph(); await startChat(); await startMic(); })();
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
-
-  /* ---------- Send text ---------- */
-  const handleSend = useCallback(async () => {
-    const text = input.trim();
-    if (!text) return;
-    setInput('');
-    lastActivityRef.current = Date.now();
+  async function handleUserTranscript(text) {
+    bumpActivity();
     setMessages((m) => [...m, { role: 'user', content: text }]);
-    await sendToAgent(text);
-    // Keep mic alive through text interactions too
-    if (micOn) safeRestartRecognition();
-  }, [input, sendToAgent, micOn, safeRestartRecognition]);
 
-  /* ---------- Pill text ---------- */
-  const pillText = micOn
-    ? (status === 'speaking' ? 'speaking' : 'listening')
-    : (autoStopped ? 'Turn Mic On to Speak' : 'mic off');
+    const reply = await sendToAgent(text);
+    setMessages((m) => [...m, { role: 'assistant', content: reply }]);
+    bumpActivity(); // reply counts as activity
 
-  /* -------------------------------- UI -------------------------------- */
+    await speakText(reply);
+  }
+
+  function handleSubmit(e) {
+    e.preventDefault();
+    const fd = new FormData(e.currentTarget);
+    const t = (fd.get('t') || '').toString().trim();
+    if (!t) return;
+    e.currentTarget.reset();
+    handleUserTranscript(t);
+  }
+
+  function handleRestart() {
+    // Clear chat + get a new chatId
+    setMessages([{ role: 'assistant', content: "G’day! I’m Otto 👋  Type below or tap the mic to talk." }]);
+    fetch('/api/retell-chat/start', { cache: 'no-store' })
+      .then(r => r.json().catch(() => ({})))
+      .then(j => { if (j?.ok && j.chatId) setChatId(j.chatId); });
+
+    // Keep mic state as-is; if ON, restart recognition cleanly
+    if (micOn) {
+      stopRecognition('restart');
+      setTimeout(() => startRecognition(false), 120);
+    }
+  }
+
+  function toggleMic() {
+    if (micOn) {
+      wantListeningRef.current = false;
+      setMicOn(false);
+      stopRecognition('toggle_off');
+      setStatus('Turn Mic On to Speak');
+    } else {
+      ensureMicPermission().finally(() => {
+        wantListeningRef.current = true;
+        startRecognition(true);
+      });
+    }
+  }
+
+  function toggleSound() {
+    setSoundOn((v) => !v);
+    bumpActivity();
+  }
+
+  // --------------------------- Waveform UI -------------------------------
+
+  const barsRef = useRef(null);
+  useEffect(() => {
+    let raf = 0;
+    function draw() {
+      const container = barsRef.current;
+      if (!container) return;
+      const analyser = analyzerRef.current;
+      const isSpeaking = speaking; // local snapshot
+
+      const children = container.children;
+      if (!children || children.length === 0) return;
+
+      if (analyser && (isSpeaking || (audioElRef.current && !audioElRef.current.paused))) {
+        const bufLen = analyser.frequencyBinCount;
+        const data = new Uint8Array(bufLen);
+        analyser.getByteFrequencyData(data);
+
+        for (let i = 0; i < children.length; i++) {
+          const idx = ((i / children.length) * bufLen) | 0;
+          const v = (data[idx] || 0) / 255; // 0..1
+          const h = 8 + Math.round(v * 36); // bar height
+          children[i].style.transform = `scaleY(${Math.max(0.15, h / 36)})`;
+          children[i].style.opacity = Math.max(0.35, v + 0.25).toString();
+        }
+      } else {
+        // idle shimmer
+        const t = (now() / 550) % (2 * Math.PI);
+        for (let i = 0; i < children.length; i++) {
+          const v = (Math.sin(t + i * 0.35) + 1) / 2;
+          const h = 8 + Math.round(v * 20);
+          children[i].style.transform = `scaleY(${Math.max(0.15, h / 36)})`;
+          children[i].style.opacity = (0.35 + v * 0.3).toString();
+        }
+      }
+      raf = requestAnimationFrame(draw);
+      animRef.current = raf;
+    }
+    raf = requestAnimationFrame(draw);
+    return () => cancelAnimationFrame(raf);
+  }, [speaking]);
+
+  // ------------------------------ Render ---------------------------------
+
   return (
     <div className="wrap">
-      <div className="panel">
-        <header className="bar">
-          <div className="title">
-            <strong>Otto</strong> — Your Auto-Mate!
-            <span className={`pill ${status}`}>{pillText}</span>
-            {statusNote && <span className="hint">{statusNote}</span>}
+      <style>{styles}</style>
+
+      {/* Top: visualizer */}
+      <div className="top">
+        <div className="statusRow">
+          <div className={cls('pill', micOn ? (speaking ? 'pillSpeaking' : 'pillOn') : 'pillOff')}>
+            {micOn ? (speaking ? 'Speaking' : (status || 'Listening')) : (status || 'Turn Mic On to Speak')}
           </div>
+
           <div className="controls">
-            <button className={`btn ${micOn ? 'on' : ''}`} onClick={handleToggleMic} title="Mic on/off" aria-label="Mic on/off">
-              <span className="icon">🎙️</span>{micOn ? 'Mic On' : 'Mic Off'}
+            <button
+              className={cls('btn', micOn ? '' : 'btnOff')}
+              onClick={toggleMic}
+              title={micOn ? 'Turn microphone off' : 'Turn microphone on'}
+              aria-label="Toggle microphone"
+            >
+              <span className="i">🎙️</span>
+              <span>{micOn ? 'Mic On' : 'Mic Off'}</span>
             </button>
-            <button className={`btn ${muted ? '' : 'on'}`} onClick={handleToggleMute} title="Sound on/off" aria-label="Sound on/off">
-              <span className="icon">{muted ? '🔇' : '🔊'}</span>{muted ? 'Sound Off' : 'Sound On'}
+
+            <button
+              className={cls('btn', soundOn ? '' : 'btnOff')}
+              onClick={toggleSound}
+              title={soundOn ? 'Mute assistant' : 'Unmute assistant'}
+              aria-label="Toggle sound"
+            >
+              <span className="i">🔊</span>
+              <span>{soundOn ? 'Sound On' : 'Sound Off'}</span>
             </button>
-            <button className="btn" onClick={handleRestart} title="Restart" aria-label="Restart conversation">
-              <span className="icon">↻</span>
+
+            <button
+              className="btn"
+              onClick={handleRestart}
+              title="Restart conversation"
+              aria-label="Restart conversation"
+            >
+              <span className="i">🔄</span>
+              <span>Restart</span>
             </button>
           </div>
-        </header>
-
-        <div className="viz"><Visualizer analyser={analyserRef.current} /></div>
-
-        <div className="scroll">
-          {messages.map((m, i) => (
-            <div key={i} className={`msg ${m.role}`}>
-              <div className="bubble">{m.content}</div>
-            </div>
-          ))}
-          <div ref={endRef} />
         </div>
 
-        <div className="composer">
-          <input
-            className="input"
-            value={input}
-            onChange={(e) => setInput(e.target.value)}
-            placeholder={`Type a message… ${micOn ? '(mic is on)' : ''}`}
-            onKeyDown={(e) => { if (e.key === 'Enter') handleSend(); }}
-            aria-label="Type a message"
-          />
-          <button className="send" onClick={handleSend} aria-label="Send">➤</button>
+        <div className="bars" ref={barsRef} aria-hidden>
+          {Array.from({ length: 48 }).map((_, i) => <span key={i} />)}
         </div>
       </div>
 
-      {needsAudioUnlock && (
-        <div className="overlay">
-          <button
-            className="unlock"
-            onClick={async () => { await ensureAudioGraph(); await startChat(); await startMic(); }}
-          >
-            Tap to enable audio
-          </button>
+      {/* Bottom: chat */}
+      <div className="chat">
+        <header className="chatHead">
+          <div className="title">
+            <strong>Otto</strong> — <span>Your Auto-Mate!</span>
+          </div>
+        </header>
+
+        <div className="list" ref={listRef}>
+          {messages.map((m, i) => (
+            <div key={i} className={cls('bubble', m.role === 'user' ? 'user' : 'assistant')}>
+              {m.content}
+            </div>
+          ))}
         </div>
-      )}
 
-      <style jsx>{`
-        .wrap { height: 100vh; background: #0b0f19; color: #dbe7ff; }
-        .panel { height: 100%; display: flex; flex-direction: column; }
-
-        .bar {
-          flex: 0 0 50px; display: flex; align-items: center; justify-content: space-between;
-          padding: 0 12px; background: rgba(20, 26, 40, 0.9);
-          border-bottom: 1px solid rgba(255,255,255,0.08);
-          position: sticky; top: 0; z-index: 2;
-        }
-        .title { font-size: 14px; letter-spacing: .2px; color: #E5EEFF; display:flex; gap:10px; align-items:center; flex-wrap: wrap; }
-        .pill { font-size: 12px; padding: 2px 8px; border-radius: 999px; background: #1f2937; color:#a5b4fc; text-transform: capitalize; white-space: nowrap; }
-        .pill.listening { background: #0b3b2f; color: #34d399; }
-        .pill.speaking  { background: #1e3a8a; color: #93c5fd; text-transform: none; }
-        .pill.mic-off   { background: #3a243a; color: #f0abfc; text-transform: none; }
-        .pill.error     { background: #3f1d1d; color: #fca5a5; }
-        .hint { font-size: 12px; opacity: .9; color: #9fb3ff; }
-
-        .controls { display:flex; gap:8px; }
-        .btn {
-          display: inline-flex; align-items: center; gap: 6px;
-          padding: 6px 10px; border-radius: 10px; font-size: 12px;
-          border: 1px solid rgba(255,255,255,0.08);
-          background: linear-gradient(180deg, rgba(255,255,255,.06), rgba(255,255,255,.02));
-          color: #dbe7ff; cursor: pointer;
-        }
-        .btn.on { box-shadow: 0 0 0 1px rgba(99,102,241, .6), 0 0 18px rgba(99,102,241, .35) inset; }
-        .btn:hover { background: rgba(255,255,255,.08); }
-        .icon { filter: saturate(1.2); }
-
-        .viz {
-          flex: 0 0 140px;
-          border-bottom: 1px solid rgba(255,255,255,0.06);
-          background: radial-gradient(1200px 140px at 50% 100%, rgba(56, 189, 248, .15), transparent 70%);
-        }
-        .scroll { flex: 1 1 auto; min-height: 0; overflow-y: auto; padding: 12px; display: flex; flex-direction: column; gap: 10px; }
-        .msg { display: flex; }
-        .msg.user { justify-content: flex-end; }
-        .bubble {
-          max-width: 80%; padding: 10px 12px; border-radius: 14px;
-          background: rgba(255,255,255,0.06); border: 1px solid rgba(255,255,255,0.08);
-          color: #e6efff; font-size: 14px; line-height: 1.35;
-        }
-        .msg.user .bubble {
-          background: linear-gradient(180deg, rgba(96,165,250,.15), rgba(59,130,246,.08));
-          border-color: rgba(96,165,250,.35);
-        }
-        .composer {
-          flex: 0 0 58px; display: flex; gap: 8px; align-items: center;
-          padding: 8px 10px; border-top: 1px solid rgba(255,255,255,0.06);
-          background: rgba(10,14,24,.95); position: sticky; bottom: 0; z-index: 2;
-        }
-        .input {
-          flex: 1; min-width: 0; height: 40px; border-radius: 12px;
-          border: 1px solid rgba(255,255,255,0.10);
-          background: rgba(255,255,255,0.04);
-          color: #e7eeff; padding: 0 12px; font-size: 14px;
-        }
-        .input::placeholder { color: #93a4c7; }
-        .send {
-          height: 40px; padding: 0 14px; border-radius: 12px; cursor: pointer;
-          background: linear-gradient(180deg, rgba(99,102,241,.9), rgba(59,130,246,.9));
-          border: 1px solid rgba(147,197,253,.5); color: #fff; font-weight: 600;
-          box-shadow: 0 6px 22px rgba(59,130,246,.25);
-        }
-        .overlay { position: absolute; inset: 0; display: grid; place-items: center; background: rgba(4,6,12,.66); backdrop-filter: blur(2px); }
-        .unlock {
-          padding: 12px 18px; border-radius: 14px; font-size: 14px; font-weight: 600;
-          background: #111827; color: #dbe7ff; border: 1px solid rgba(99,102,241,.6);
-          box-shadow: 0 0 0 1px rgba(99,102,241,.6), 0 18px 50px rgba(59,130,246,.25);
-        }
-      `}</style>
+        <form className="inputRow" onSubmit={handleSubmit}>
+          <input
+            name="t"
+            className="inp"
+            placeholder={`Type a message… ${micOn ? '(mic is on)' : '(mic is off)'}`}
+            autoComplete="off"
+            onFocus={bumpActivity}
+            onKeyDown={bumpActivity}
+          />
+          <button className="send" aria-label="Send message" title="Send">
+            ➤
+          </button>
+        </form>
+      </div>
     </div>
   );
 }
+
+// ------------------------------ Styles -----------------------------------
+
+const styles = `
+.wrap{
+  display:flex; flex-direction:column; width:100%; height:100%;
+  background:#0B0F19; color:#E6E8EE; font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial;
+}
+.top{ flex: 0 0 45%; min-height:180px; padding:14px 14px 8px; display:flex; flex-direction:column; }
+.statusRow{ display:flex; align-items:center; justify-content:space-between; gap:10px; margin-bottom:10px; }
+.pill{
+  font-size:12px; letter-spacing:.2px; padding:6px 10px; border-radius:999px;
+  background:rgba(255,255,255,0.05); border:1px solid rgba(255,255,255,0.08);
+}
+.pillOn{ background: rgba(22,163,74,0.15); border-color: rgba(22,163,74,0.35); color:#b9f6ca; }
+.pillSpeaking{ background: rgba(59,130,246,0.18); border-color: rgba(59,130,246,0.45); color:#dbeafe; }
+.pillOff{ background: rgba(148,163,184,0.12); border-color: rgba(148,163,184,0.28); color:#e2e8f0; }
+
+.controls{ display:flex; gap:8px; }
+.btn{
+  display:inline-flex; align-items:center; gap:6px; padding:7px 10px;
+  background:rgba(255,255,255,0.06); color:#E6E8EE; border:1px solid rgba(255,255,255,0.12);
+  border-radius:10px; font-size:12px; cursor:pointer; transition:all .15s ease;
+}
+.btn:hover{ background:rgba(255,255,255,0.12); }
+.btnOff{ opacity:.7; background:rgba(15,23,42,0.6); }
+.btn .i{ font-size:14px; }
+
+.bars{
+  flex:1; display:flex; align-items:flex-end; gap:4px; padding:14px 10px;
+  background:linear-gradient(180deg, rgba(255,255,255,0.04), rgba(255,255,255,0.02));
+  border:1px solid rgba(255,255,255,0.08); border-radius:14px;
+  overflow:hidden;
+}
+.bars span{
+  display:block; width:calc((100% - 47*4px)/48); height:36px; transform-origin:bottom;
+  background:linear-gradient(180deg, #7cc6ff, #3b82f6);
+  border-radius:4px; opacity:.6; transform:scaleY(.3);
+}
+
+.chat{ flex:1; display:flex; flex-direction:column; border-top:1px solid rgba(255,255,255,0.06); }
+.chatHead{ flex:0 0 auto; padding:10px 14px; display:flex; align-items:center; justify-content:space-between; }
+.chatHead .title{ font-size:13px; color:#c7d2fe; }
+.list{
+  flex:1; overflow:auto; padding:10px 12px; display:flex; flex-direction:column; gap:10px;
+}
+.bubble{
+  max-width:85%; padding:10px 12px; border-radius:12px;
+  line-height:1.35; font-size:14px; white-space:pre-wrap; word-break:break-word;
+}
+.assistant{
+  align-self:flex-start; background:rgba(30,41,59,0.7); border:1px solid rgba(148,163,184,0.25); color:#E6E8EE;
+}
+.user{
+  align-self:flex-end; background:#3b82f6; color:white; border:1px solid rgba(59,130,246,0.65);
+}
+
+.inputRow{
+  flex:0 0 auto; display:flex; gap:8px; padding:10px 12px; border-top:1px solid rgba(255,255,255,0.06);
+}
+.inp{
+  flex:1; padding:10px 12px; background:rgba(255,255,255,0.06); border:1px solid rgba(255,255,255,0.12);
+  border-radius:12px; color:#E6E8EE; outline:none; font-size:14px;
+}
+.inp::placeholder{ color:#9aa7bd; }
+.send{
+  flex:0 0 auto; width:38px; height:38px; border-radius:12px; border:1px solid rgba(255,255,255,0.15);
+  background:linear-gradient(180deg, #7cc6ff, #3b82f6); color:white; font-size:16px; cursor:pointer;
+}
+
+@media (max-width:520px){
+  .top{ flex-basis:40%; }
+  .bars span{ width:calc((100% - 31*4px)/32); }
+}
+`;
+
