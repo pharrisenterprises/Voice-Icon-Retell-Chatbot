@@ -1,24 +1,25 @@
 // app/lib/retellRealtime.js
-// -----------------------------------------------------------
-// Azure Neural TTS version – keeps all mic animations,
-// amplitude visualization, and UI status logic identical.
-// Only replaces browser speechSynthesis with Azure TTS.
-// -----------------------------------------------------------
+// ---------------------------------------------------------------------------
+// Full-feature version: keeps mic animation, amplitude visualization,
+// speech timing, and UI status — but forces Azure Neural TTS voice playback.
+// ---------------------------------------------------------------------------
 
 export default function createRetellRealtime() {
   const USE_REALTIME = false;
   if (USE_REALTIME) return createRealtimeStub();
-  return createWebSpeechWithAzureTTS();
+  return createAzureRealtime();
 }
 
-/* -------------------- 2) Web Speech + Azure TTS Hybrid -------------------- */
+/* -------------------- Azure TTS + Mic Visualization -------------------- */
 
-function createWebSpeechWithAzureTTS() {
+function createAzureRealtime() {
+  // --- Web Speech Recognition for mic (unchanged) ---
   const SR =
-    typeof window !== 'undefined' &&
+    typeof window !== "undefined" &&
     (window.SpeechRecognition || window.webkitSpeechRecognition);
   const hasASR = !!SR;
 
+  // --- Internal state ---
   let rec = null;
   let recActive = false;
   let mediaStream = null;
@@ -28,6 +29,7 @@ function createWebSpeechWithAzureTTS() {
   let ampRAF = null;
   let speakingTimer = null;
 
+  // --- UI callbacks ---
   let onAgentText = () => {};
   let onAudioBuffer = () => {};
   let onStatus = () => {};
@@ -36,7 +38,9 @@ function createWebSpeechWithAzureTTS() {
   let getMuted = () => false;
 
   function setStatus(s) {
-    try { onStatus(s); } catch {}
+    try {
+      onStatus(s);
+    } catch {}
   }
 
   function ensureAudioCtx() {
@@ -62,7 +66,9 @@ function createWebSpeechWithAzureTTS() {
         sum += v * v;
       }
       const rms = Math.sqrt(sum / data.length);
-      try { onAudioBuffer(Math.min(1, rms * 3)); } catch {}
+      try {
+        onAudioBuffer(Math.min(1, rms * 3));
+      } catch {}
       ampRAF = requestAnimationFrame(loop);
     };
     ampRAF = requestAnimationFrame(loop);
@@ -84,103 +90,110 @@ function createWebSpeechWithAzureTTS() {
     } catch {}
   }
 
-  // -------------- 🔊 Azure Neural TTS Integration -----------------
+  // -------------------- 🔊 Azure Neural TTS --------------------
   async function speakText(text) {
     if (!text || getMuted()) return;
-    setStatus('speaking');
-
-    // Cancel any previous playback
+    setStatus("speaking");
     clearInterval(speakingTimer);
 
     try {
-      // Fetch neural speech from Azure via our API route
-      const res = await fetch('/api/tts/speak', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+      const res = await fetch("/api/tts/speak", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ text }),
       });
       if (!res.ok) throw new Error(`Azure TTS failed (${res.status})`);
+
       const blob = await res.blob();
       const url = URL.createObjectURL(blob);
       const audio = new Audio(url);
 
-      // Animate bars during playback
+      // animate bars while speaking
       if (!recActive) {
         speakingTimer = setInterval(() => {
-          const amp = 0.2 + Math.random() * 0.6;
-          try { onAudioBuffer(amp); } catch {}
+          const amp = 0.25 + Math.random() * 0.6;
+          try {
+            onAudioBuffer(amp);
+          } catch {}
         }, 90);
       }
 
       audio.onended = () => {
         clearInterval(speakingTimer);
         speakingTimer = null;
-        try { onAudioBuffer(0); } catch {}
-        setStatus(recActive ? 'ready' : 'idle');
+        try {
+          onAudioBuffer(0);
+        } catch {}
+        setStatus(recActive ? "ready" : "idle");
       };
 
       await audio.play();
-    } catch (e) {
-      console.error('Azure TTS playback failed:', e);
+    } catch (err) {
+      console.error("Azure playback error:", err);
       clearInterval(speakingTimer);
       speakingTimer = null;
-      setStatus('error');
+      setStatus("error");
     }
   }
 
-  // ---------------------------------------------------------------
-
+  // -------------------- Mic / Recognition --------------------
   async function startMic(stream) {
     try {
-      setStatus('connecting');
+      setStatus("connecting");
       const userStream =
-        stream ||
-        (await navigator.mediaDevices.getUserMedia({ audio: true }));
+        stream || (await navigator.mediaDevices.getUserMedia({ audio: true }));
       mediaStream = userStream;
       await initMicAnalyser(userStream);
 
       if (hasASR) {
         rec = new SR();
-        rec.lang = 'en-US';
+        rec.lang = "en-US";
         rec.continuous = true;
         rec.interimResults = true;
 
-        let partial = '';
+        let partial = "";
         rec.onresult = (e) => {
-          let finalText = '';
+          let finalText = "";
           for (let i = e.resultIndex; i < e.results.length; i++) {
             const res = e.results[i];
             if (res.isFinal) finalText += res[0].transcript;
             else partial = res[0].transcript;
           }
           if (finalText.trim()) {
-            try { onUserText(finalText.trim()); } catch {}
-            partial = '';
+            try {
+              onUserText(finalText.trim());
+            } catch {}
+            partial = "";
           }
         };
         rec.onerror = () => {};
         rec.onend = () => {
           if (recActive) {
-            try { rec.start(); } catch {}
+            try {
+              rec.start();
+            } catch {}
           }
         };
-
-        try { rec.start(); } catch {}
+        try {
+          rec.start();
+        } catch {}
       }
 
       recActive = true;
-      setStatus('ready');
+      setStatus("ready");
       return true;
     } catch (e) {
       recActive = false;
-      setStatus('error');
+      setStatus("error");
       throw e;
     }
   }
 
   async function stopMic() {
     recActive = false;
-    try { rec && rec.stop && rec.stop(); } catch {}
+    try {
+      rec && rec.stop && rec.stop();
+    } catch {}
     rec = null;
 
     stopAmpLoop();
@@ -195,9 +208,10 @@ function createWebSpeechWithAzureTTS() {
     } catch {}
     mediaStream = null;
 
-    setStatus('idle');
+    setStatus("idle");
   }
 
+  // -------------------- Connection + Lifecycle --------------------
   async function connect(opts) {
     onAgentText = opts?.onAgentText || onAgentText;
     onAudioBuffer = opts?.onAudioBuffer || onAudioBuffer;
@@ -206,19 +220,22 @@ function createWebSpeechWithAzureTTS() {
     getChatId = opts?.getChatId || getChatId;
     getMuted = opts?.getMuted || getMuted;
     ensureAudioCtx();
-    setStatus('idle');
+    setStatus("idle");
     return true;
   }
 
   async function disconnect() {
-    try { await stopMic(); } catch {}
-    setStatus('idle');
+    try {
+      await stopMic();
+    } catch {}
+    setStatus("idle");
   }
 
   async function sendText(_text) {
     return true;
   }
 
+  // -------------------- Public API --------------------
   return {
     connect,
     startMic,
@@ -229,7 +246,7 @@ function createWebSpeechWithAzureTTS() {
   };
 }
 
-/* -------------------- 1) Retell Realtime Stub (for later use) -------------------- */
+/* -------------------- Retell Realtime Stub (unused placeholder) -------------------- */
 function createRealtimeStub() {
   let onAgentText = () => {};
   let onAudioBuffer = () => {};
@@ -245,14 +262,14 @@ function createRealtimeStub() {
     onUserText = opts?.onUserText || onUserText;
     getChatId = opts?.getChatId || getChatId;
     getMuted = opts?.getMuted || getMuted;
-    onStatus('idle');
+    onStatus("idle");
     return true;
   }
-  async function startMic() { onStatus('ready'); }
-  async function stopMic() { onStatus('idle'); }
+  async function startMic() { onStatus("ready"); }
+  async function stopMic() { onStatus("idle"); }
   async function speakText() {}
   async function sendText() { return true; }
-  async function disconnect() { onStatus('idle'); }
+  async function disconnect() { onStatus("idle"); }
 
   return { connect, startMic, stopMic, speakText, sendText, disconnect };
 }
