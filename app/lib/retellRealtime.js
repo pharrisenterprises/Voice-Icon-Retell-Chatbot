@@ -1,37 +1,24 @@
 // app/lib/retellRealtime.js
-//
-// Minimal voice helper with two modes:
-// 1) Realtime (stubbed entry points for Retell streaming)  → TODO when you enable Retell Realtime
-// 2) Fallback (ships now): Web Speech ASR + speechSynthesis TTS
-//
-// Public API the page expects:
-//   const rt = createRetellRealtime();
-//   await rt.connect({ onAgentText, onAudioBuffer, onStatus, onUserText, getChatId, getMuted });
-//   await rt.startMic();  await rt.stopMic();
-//   await rt.speakText(text);
-//   await rt.sendText(text);   // (no-op here; page posts to /api/* itself)
-//   rt.disconnect();
+// -----------------------------------------------------------
+// Azure Neural TTS version – keeps all mic animations,
+// amplitude visualization, and UI status logic identical.
+// Only replaces browser speechSynthesis with Azure TTS.
+// -----------------------------------------------------------
 
 export default function createRetellRealtime() {
-  // If you later wire Retell Realtime WS/WebRTC, flip this to true and fill in the TODOs.
   const USE_REALTIME = false;
-
   if (USE_REALTIME) return createRealtimeStub();
-  return createWebSpeechFallback();
+  return createWebSpeechWithAzureTTS();
 }
 
-/* -------------------- 2) BROWSER FALLBACK: Web Speech -------------------- */
+/* -------------------- 2) Web Speech + Azure TTS Hybrid -------------------- */
 
-function createWebSpeechFallback() {
-  // Feature detect
+function createWebSpeechWithAzureTTS() {
   const SR =
     typeof window !== 'undefined' &&
     (window.SpeechRecognition || window.webkitSpeechRecognition);
   const hasASR = !!SR;
-  const hasTTS =
-    typeof window !== 'undefined' && 'speechSynthesis' in window;
 
-  // Internal state
   let rec = null;
   let recActive = false;
   let mediaStream = null;
@@ -41,7 +28,6 @@ function createWebSpeechFallback() {
   let ampRAF = null;
   let speakingTimer = null;
 
-  // Callbacks from the page
   let onAgentText = () => {};
   let onAudioBuffer = () => {};
   let onStatus = () => {};
@@ -49,7 +35,6 @@ function createWebSpeechFallback() {
   let getChatId = () => null;
   let getMuted = () => false;
 
-  // Small helpers
   function setStatus(s) {
     try { onStatus(s); } catch {}
   }
@@ -71,13 +56,12 @@ function createWebSpeechFallback() {
     const data = new Uint8Array(analyser.fftSize);
     const loop = () => {
       analyser.getByteTimeDomainData(data);
-      // Compute a rough amplitude 0..1
       let sum = 0;
       for (let i = 0; i < data.length; i++) {
         const v = (data[i] - 128) / 128;
         sum += v * v;
       }
-      const rms = Math.sqrt(sum / data.length); // ~0..1
+      const rms = Math.sqrt(sum / data.length);
       try { onAudioBuffer(Math.min(1, rms * 3)); } catch {}
       ampRAF = requestAnimationFrame(loop);
     };
@@ -97,83 +81,56 @@ function createWebSpeechFallback() {
       analyser.fftSize = 256;
       micSource.connect(analyser);
       startAmpLoop();
-    } catch {
-      // Non-fatal; visualizer just won’t move
-    }
-  }
-
-  // TTS with a little “unlock” dance for iOS/Autoplay
-  function maybeUnlockTTS() {
-    try {
-      if (!hasTTS) return;
-      // iOS can pause the engine; resume on user gesture or first call
-      if (typeof window.speechSynthesis.resume === 'function') {
-        window.speechSynthesis.resume();
-      }
-      // Send a silent utterance once to wake it
-      const u = new SpeechSynthesisUtterance(' ');
-      u.volume = 0;
-      window.speechSynthesis.speak(u);
     } catch {}
   }
 
+  // -------------- 🔊 Azure Neural TTS Integration -----------------
   async function speakText(text) {
-    if (!hasTTS) return;
     if (!text || getMuted()) return;
     setStatus('speaking');
-    maybeUnlockTTS();
+
+    // Cancel any previous playback
+    clearInterval(speakingTimer);
 
     try {
-      // Cancel anything queued
-      if (window.speechSynthesis.speaking) {
-        window.speechSynthesis.cancel();
-      }
-    } catch {}
+      // Fetch neural speech from Azure via our API route
+      const res = await fetch('/api/tts/speak', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text }),
+      });
+      if (!res.ok) throw new Error(`Azure TTS failed (${res.status})`);
+      const blob = await res.blob();
+      const url = URL.createObjectURL(blob);
+      const audio = new Audio(url);
 
-    return new Promise((resolve) => {
-      const u = new SpeechSynthesisUtterance(text);
-      // Tune voice feel here if you like:
-      u.rate = 1.0;
-      u.pitch = 1.0;
-      u.volume = getMuted() ? 0 : 1;
-
-      // Animate the bars while speaking (if no mic analyser is active)
-      clearInterval(speakingTimer);
+      // Animate bars during playback
       if (!recActive) {
         speakingTimer = setInterval(() => {
-          // synthetic amplitude ~0.2..0.8 to make bars move
           const amp = 0.2 + Math.random() * 0.6;
           try { onAudioBuffer(amp); } catch {}
         }, 90);
       }
 
-      u.onend = () => {
+      audio.onended = () => {
         clearInterval(speakingTimer);
         speakingTimer = null;
+        try { onAudioBuffer(0); } catch {}
         setStatus(recActive ? 'ready' : 'idle');
-        resolve();
-      };
-      u.onerror = () => {
-        clearInterval(speakingTimer);
-        speakingTimer = null;
-        setStatus(recActive ? 'ready' : 'idle');
-        resolve();
       };
 
-      try {
-        window.speechSynthesis.speak(u);
-      } catch {
-        // Fail silently; we still resolve to keep UI snappy
-        clearInterval(speakingTimer);
-        speakingTimer = null;
-        setStatus(recActive ? 'ready' : 'idle');
-        resolve();
-      }
-    });
+      await audio.play();
+    } catch (e) {
+      console.error('Azure TTS playback failed:', e);
+      clearInterval(speakingTimer);
+      speakingTimer = null;
+      setStatus('error');
+    }
   }
 
+  // ---------------------------------------------------------------
+
   async function startMic(stream) {
-    // Called by page when user toggles Mic ON
     try {
       setStatus('connecting');
       const userStream =
@@ -193,29 +150,22 @@ function createWebSpeechFallback() {
           let finalText = '';
           for (let i = e.resultIndex; i < e.results.length; i++) {
             const res = e.results[i];
-            if (res.isFinal) {
-              finalText += res[0].transcript;
-            } else {
-              partial = res[0].transcript;
-            }
+            if (res.isFinal) finalText += res[0].transcript;
+            else partial = res[0].transcript;
           }
-          // We show partial ASR as "assistant_stream" in the page, but
-          // since it's user speech, we don't add to chat until final.
           if (finalText.trim()) {
             try { onUserText(finalText.trim()); } catch {}
             partial = '';
           }
         };
-        rec.onerror = () => { /* ignore; Safari fires harmless errors */ };
+        rec.onerror = () => {};
         rec.onend = () => {
-          // When mic is toggled off or browser halts recognition
           if (recActive) {
-            // Try to keep it going unless user turned it off
             try { rec.start(); } catch {}
           }
         };
 
-        try { rec.start(); } catch { /* some browsers need a delay */ }
+        try { rec.start(); } catch {}
       }
 
       recActive = true;
@@ -241,9 +191,7 @@ function createWebSpeechFallback() {
     } catch {}
 
     try {
-      if (mediaStream) {
-        mediaStream.getTracks().forEach((t) => t.stop());
-      }
+      if (mediaStream) mediaStream.getTracks().forEach((t) => t.stop());
     } catch {}
     mediaStream = null;
 
@@ -257,33 +205,17 @@ function createWebSpeechFallback() {
     onUserText = opts?.onUserText || onUserText;
     getChatId = opts?.getChatId || getChatId;
     getMuted = opts?.getMuted || getMuted;
-
-    // Prime audio so the page can decide to show "Enable audio"
     ensureAudioCtx();
     setStatus('idle');
-
-    // Load TTS voices early (best-effort)
-    if (hasTTS) {
-      try {
-        // iOS sometimes needs a resume after a user gesture; page handles overlay too
-        window.speechSynthesis.onvoiceschanged = () => {};
-      } catch {}
-    }
-
     return true;
   }
 
   async function disconnect() {
     try { await stopMic(); } catch {}
-    try {
-      if (window.speechSynthesis) window.speechSynthesis.cancel();
-    } catch {}
     setStatus('idle');
   }
 
   async function sendText(_text) {
-    // The page already POSTs to /api/retell-chat/send and then calls speakText(reply).
-    // We keep this method for parity with realtime mode.
     return true;
   }
 
@@ -297,16 +229,8 @@ function createWebSpeechFallback() {
   };
 }
 
-/* -------------------- 1) RETELL REALTIME (stub to fill later) -------------------- */
-
+/* -------------------- 1) Retell Realtime Stub (for later use) -------------------- */
 function createRealtimeStub() {
-  // This is a placeholder for when you enable Retell Realtime Streaming.
-  // You would:
-  //  - open a WS/WebRTC to Retell with your API key (server-signed token)
-  //  - send mic PCM frames
-  //  - receive audio frames and play via WebAudio
-  //  - stream partial transcripts via onAgentText(partial, false) and final via onAgentText(final, true)
-
   let onAgentText = () => {};
   let onAudioBuffer = () => {};
   let onStatus = () => {};
