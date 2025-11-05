@@ -10,6 +10,7 @@ import React, { useEffect, useMemo, useRef, useState } from 'react';
  * - Auto-resume listening after TTS if mic is desired.
  * - Echo-cancelled getUserMedia prompt.
  * - Dark UI + waveform + auto-scroll.
+ * - NEW: full teardown() + window.widgetStop() to let host close/stop everything.
  */
 
 // ----------------------------- Tunables ---------------------------------
@@ -132,10 +133,12 @@ export default function EmbedPage() {
       setTimeout(() => startRecognition(true), 50);
     }
 
+    // expose stop to host immediately
+    window.widgetStop = teardown;
+
     return () => {
-      stopRecognition('unmount');
-      cancelAnimationFrame(animRef.current || 0);
-      try { audio.pause(); } catch {}
+      try { delete window.widgetStop; } catch {}
+      teardown(); // ensure full stop on unmount
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -294,8 +297,8 @@ export default function EmbedPage() {
       u.pitch = 1.08;
       u.onend = resolve;
       u.onerror = resolve;
-      window.speechSynthesis.cancel();
-      window.speechSynthesis.speak(u);
+      try { window.speechSynthesis.cancel(); } catch {}
+      try { window.speechSynthesis.speak(u); } catch {}
     });
   }
 
@@ -321,7 +324,7 @@ export default function EmbedPage() {
     try {
       if (soundOn) {
         try { await playAzureTTS(text); }
-        catch { await playWebSpeech(text); }
+        catch { await playWebSpeech(text); } // keeps old fallback unless you want to remove it
       } else {
         await new Promise((r) => setTimeout(r, 220));
       }
@@ -434,6 +437,56 @@ export default function EmbedPage() {
     raf = requestAnimationFrame(draw);
     return () => cancelAnimationFrame(raf);
   }, [speaking]);
+
+  // -------------------- Widget teardown (FULL STOP) --------------------
+
+  function teardown() {
+    try { console.log('[Widget] Teardown – stopping all media and timers'); } catch {}
+
+    // Stop mic recognition loop
+    try { recognizerRef.current?.stop(); } catch {}
+    recognizerRef.current = null;
+
+    // Disable desire to listen
+    wantListeningRef.current = false;
+    setMicOn(false);
+
+    // Stop idle timer
+    try { clearTimeout(idleTimerRef.current); } catch {}
+    idleTimerRef.current = 0;
+
+    // Stop waveform animation
+    try { cancelAnimationFrame(animRef.current || 0); } catch {}
+    animRef.current = 0;
+
+    // Stop audio playback and clear src
+    try {
+      const a = audioElRef.current;
+      if (a) { a.pause(); a.src = ''; }
+    } catch {}
+
+    // Stop any ongoing speech synthesis (fallback engine) just in case
+    try { window.speechSynthesis?.cancel(); } catch {}
+
+    // Close audio context (disconnects analyser and audio path)
+    try { audioCtxRef.current?.close(); } catch {}
+    audioCtxRef.current = null;
+    analyzerRef.current = null;
+
+    // Reset visual/UX state
+    speakingRef.current = false;
+    setSpeaking(false);
+    setSoundOn(false);
+    setStatus('Turn Mic On to Speak');
+  }
+
+  // Expose stop to host page so a close button outside the iframe can call it.
+  useEffect(() => {
+    window.widgetStop = teardown;
+    return () => {
+      try { delete window.widgetStop; } catch {}
+    };
+  }, []);
 
   // -------------------- UI --------------------
 
