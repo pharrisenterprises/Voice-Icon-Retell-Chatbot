@@ -4,13 +4,7 @@ import React, { useEffect, useMemo, useRef, useState } from 'react';
 
 /**
  * Voice-only widget (Retell text routes + client ASR + Azure/WebSpeech TTS).
- * - Azure token retrieved from /api/azure-tts-token (server-side) => no CORS, no public key.
- * - Self-talk protection (half-duplex): pause ASR while speaking + guard tail.
- * - 60s idle -> mic OFF with “Turn Mic On to Speak”.
- * - Auto-resume listening after TTS if mic is desired.
- * - Echo-cancelled getUserMedia prompt.
- * - Dark UI + waveform + auto-scroll.
- * - NEW: full teardown() + window.widgetStop() to let host close/stop everything.
+ * ...
  */
 
 // ----------------------------- Tunables ---------------------------------
@@ -72,7 +66,7 @@ export default function EmbedPage() {
 
   const [speaking, setSpeaking] = useState(false);
 
-  // Public-only voice selector (safe to expose)
+  // Public-only voice selector
   const VOICE = useMemo(
     () => (process.env.NEXT_PUBLIC_AZURE_TTS_VOICE || 'en-AU-WilliamNeural'),
     []
@@ -81,10 +75,11 @@ export default function EmbedPage() {
   // Azure token cache
   const azureRef = useRef({ token: null, region: null, exp: 0 });
 
-  // Helper: (re)ensure an AudioContext is present and armed for user unlock if needed
+  // ---------- AUDIO: (re)arm context + tiny unlock ping ----------
   function ensureAudioContextArmed() {
     const audio = audioElRef.current;
     if (!audio) return;
+
     const create = () => {
       try {
         const Ctor = (window.AudioContext || window.webkitAudioContext);
@@ -99,12 +94,14 @@ export default function EmbedPage() {
         analyzerRef.current = analyser;
       } catch {}
     };
+
     if (!audioCtxRef.current) {
       create();
     } else {
       try { audioCtxRef.current.resume(); } catch {}
     }
-    // If browser blocks autoplay, arm a one-time unlock listener again.
+
+    // Arm a one-time unlock for browsers that require user gesture later
     const unlock = () => {
       if (!audioCtxRef.current) create();
       else try { audioCtxRef.current.resume(); } catch {}
@@ -113,6 +110,19 @@ export default function EmbedPage() {
     };
     window.addEventListener('pointerdown', unlock, { once: true });
     window.addEventListener('keydown', unlock, { once: true });
+  }
+
+  function primeAutoplayUnlock() {
+    try {
+      const ctx = audioCtxRef.current;
+      if (!ctx) return;
+      const buffer = ctx.createBuffer(1, 64, 22050); // ~3ms of silence
+      const src = ctx.createBufferSource();
+      src.buffer = buffer;
+      src.connect(ctx.destination);
+      src.start(0);
+      src.stop(0.01);
+    } catch {}
   }
 
   // -------------------- Mount/init --------------------
@@ -172,7 +182,7 @@ export default function EmbedPage() {
 
     return () => {
       try { delete window.widgetStop; } catch {}
-      teardown(); // ensure full stop on unmount
+      teardown();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -220,7 +230,7 @@ export default function EmbedPage() {
         setTimeout(() => { try { R.start(); } catch {} }, RESTART_BACKOFF_MS);
       } else {
         if (!wantListeningRef.current) setStatus('Turn Mic On to Speak');
-        else setStatus(''); // speaking/pause
+        else setStatus('');
       }
     };
 
@@ -294,6 +304,7 @@ export default function EmbedPage() {
 </speak>`;
   }
 
+  // IMPORTANT: reject on play() failure so speakText() can fallback to WebSpeech
   async function playAzureTTS(text) {
     const { token, region } = await getAzureToken();
     const ttsUrl = `https://${region}.tts.speech.microsoft.com/cognitiveservices/v1`;
@@ -313,13 +324,26 @@ export default function EmbedPage() {
     const url = URL.createObjectURL(blob);
 
     const audio = audioElRef.current;
-    return new Promise((resolve) => {
+    return new Promise((resolve, reject) => {
+      let cleaned = false;
+      const cleanup = () => { if (cleaned) return; cleaned = true; try { URL.revokeObjectURL(url); } catch {} };
+
       try {
-        audio.onended = () => { URL.revokeObjectURL(url); resolve(); };
-        audio.onerror = () => { URL.revokeObjectURL(url); resolve(); };
+        audio.onended = () => { cleanup(); resolve(); };
+        audio.onerror = () => { cleanup(); reject(new Error('audio error')); };
         audio.src = url;
-        audio.play().catch(() => resolve());
-      } catch { resolve(); }
+
+        const p = audio.play();
+        if (p && typeof p.then === 'function') {
+          p.then(() => { /* playing */ }).catch((e) => { cleanup(); reject(e || new Error('play blocked')); });
+        } else {
+          // Older browsers: if it doesn't throw now, assume success
+          // If it fails later, onerror will reject.
+        }
+      } catch (e) {
+        cleanup();
+        reject(e);
+      }
     });
   }
 
@@ -358,7 +382,7 @@ export default function EmbedPage() {
     try {
       if (soundOn) {
         try { await playAzureTTS(text); }
-        catch { await playWebSpeech(text); }
+        catch { await playWebSpeech(text); } // Fallback if Azure play is blocked
       } else {
         await new Promise((r) => setTimeout(r, 220));
       }
@@ -477,49 +501,38 @@ export default function EmbedPage() {
   function teardown() {
     try { console.log('[Widget] Teardown – stopping all media and timers'); } catch {}
 
-    // Stop mic recognition loop
     try { recognizerRef.current?.stop(); } catch {}
     recognizerRef.current = null;
 
-    // Disable desire to listen
     wantListeningRef.current = false;
     setMicOn(false);
 
-    // Stop idle timer
     try { clearTimeout(idleTimerRef.current); } catch {}
     idleTimerRef.current = 0;
 
-    // Stop waveform animation
     try { cancelAnimationFrame(animRef.current || 0); } catch {}
     animRef.current = 0;
 
-    // Stop audio playback and clear src
     try {
       const a = audioElRef.current;
       if (a) { a.pause(); a.src = ''; }
     } catch {}
 
-    // Stop any ongoing speech synthesis (fallback engine) just in case
     try { window.speechSynthesis?.cancel(); } catch {}
 
-    // Close audio context (disconnects analyser and audio path)
     try { audioCtxRef.current?.close(); } catch {}
     audioCtxRef.current = null;
     analyzerRef.current = null;
 
-    // Reset visual/UX state
     speakingRef.current = false;
     setSpeaking(false);
     setSoundOn(false);
     setStatus('Turn Mic On to Speak');
   }
 
-  // Expose stop to host page so a close button outside the iframe can call it.
   useEffect(() => {
     window.widgetStop = teardown;
-    return () => {
-      try { delete window.widgetStop; } catch {}
-    };
+    return () => { try { delete window.widgetStop; } catch {} };
   }, []);
 
   // -------------------- Listen for host close/open messages --------------------
@@ -530,19 +543,17 @@ export default function EmbedPage() {
         if (!data || typeof data !== 'object') return;
 
         if (data.type === 'avatar-widget:close') {
-          // Host requests an immediate shutdown
           teardown();
         } else if (data.type === 'avatar-widget:open') {
-          // Host reopened the widget: restore defaults and resume listening
+          // Reopen: turn everything back on and make sure playback is allowed
           setSoundOn(true);
           wantListeningRef.current = true;
           setMicOn(true);
           setStatus('Listening');
 
-          // Recreate / arm audio context if it was closed during teardown
           ensureAudioContextArmed();
+          primeAutoplayUnlock();     // tiny silent ping to ease autoplay restrictions
 
-          // Make sure mic permissions are ready, then restart recognition
           ensureMicPermission().finally(() => {
             startRecognition(false);
             bumpActivity();
@@ -556,17 +567,15 @@ export default function EmbedPage() {
   // ----------------------------------------------------------------------
 
   // -------------------- UI --------------------
-
   return (
     <div className="wrap">
       <style>{styles}</style>
-
+      {/* ... UI stays unchanged ... */}
       <div className="top">
         <div className="statusRow">
           <div className={cls('pill', micOn ? (speaking ? 'pillSpeaking' : 'pillOn') : 'pillOff')}>
             {micOn ? (speaking ? 'Speaking' : (status || 'Listening')) : (status || 'Turn Mic On to Speak')}
           </div>
-
           <div className="controls">
             <button className={cls('btn', micOn ? '' : 'btnOff')} onClick={toggleMic} title={micOn ? 'Turn microphone off' : 'Turn microphone on'} aria-label="Toggle microphone">
               <span className="i">🎙️</span><span>{micOn ? 'Mic On' : 'Mic Off'}</span>
@@ -579,7 +588,6 @@ export default function EmbedPage() {
             </button>
           </div>
         </div>
-
         <div className="bars" ref={barsRef} aria-hidden>
           {Array.from({ length: 48 }).map((_, i) => <span key={i} />)}
         </div>
@@ -606,6 +614,7 @@ export default function EmbedPage() {
 }
 
 const styles = `
+/* (same CSS as before) */
 .wrap{display:flex;flex-direction:column;width:100%;height:100%;background:#0B0F19;color:#E6E8EE;font-family:ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial}
 .top{flex:0 0 45%;min-height:180px;padding:14px 14px 8px;display:flex;flex-direction:column}
 .statusRow{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:10px}
