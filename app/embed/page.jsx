@@ -488,6 +488,30 @@ export default function EmbedPage() {
     };
   }, []);
 
+  // -------------------- ADDED: listen for host close/open messages --------------------
+  useEffect(() => {
+    function onMessage(evt) {
+      try {
+        const data = evt?.data;
+        if (!data || typeof data !== 'object') return;
+        if (data.type === 'avatar-widget:close') {
+          // Host requests an immediate shutdown
+          teardown();
+        } else if (data.type === 'avatar-widget:open') {
+          // Optional: auto-start behavior when host opens the widget
+          // ensureMicPermission().finally(() => {
+          //   wantListeningRef.current = true;
+          //   setMicOn(true);
+          //   startRecognition(false);
+          // });
+        }
+      } catch {}
+    }
+    window.addEventListener('message', onMessage);
+    return () => window.removeEventListener('message', onMessage);
+  }, []);
+  // ----------------------------------------------------------------------
+
   // -------------------- UI --------------------
 
   return (
