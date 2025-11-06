@@ -4,7 +4,7 @@ import React, { useEffect, useMemo, useRef, useState } from 'react';
 
 /**
  * Voice-only widget (Retell text routes + client ASR + Azure/WebSpeech TTS).
- * ...
+ * (comments trimmed for brevity)
  */
 
 // ----------------------------- Tunables ---------------------------------
@@ -66,7 +66,10 @@ export default function EmbedPage() {
 
   const [speaking, setSpeaking] = useState(false);
 
-  // Public-only voice selector
+  // NEW: session cancel token — increment on teardown so pending audio can’t play later
+  const sessionRef = useRef(0);
+
+  // Voice
   const VOICE = useMemo(
     () => (process.env.NEXT_PUBLIC_AZURE_TTS_VOICE || 'en-AU-WilliamNeural'),
     []
@@ -75,7 +78,7 @@ export default function EmbedPage() {
   // Azure token cache
   const azureRef = useRef({ token: null, region: null, exp: 0 });
 
-  // ---------- AUDIO: (re)arm context + tiny unlock ping ----------
+  // ---------- AUDIO helpers ----------
   function ensureAudioContextArmed() {
     const audio = audioElRef.current;
     if (!audio) return;
@@ -101,7 +104,7 @@ export default function EmbedPage() {
       try { audioCtxRef.current.resume(); } catch {}
     }
 
-    // Arm a one-time unlock for browsers that require user gesture later
+    // Arm a one-time unlock for gesture-gated playback
     const unlock = () => {
       if (!audioCtxRef.current) create();
       else try { audioCtxRef.current.resume(); } catch {}
@@ -116,7 +119,7 @@ export default function EmbedPage() {
     try {
       const ctx = audioCtxRef.current;
       if (!ctx) return;
-      const buffer = ctx.createBuffer(1, 64, 22050); // ~3ms of silence
+      const buffer = ctx.createBuffer(1, 64, 22050);
       const src = ctx.createBufferSource();
       src.buffer = buffer;
       src.connect(ctx.destination);
@@ -182,7 +185,7 @@ export default function EmbedPage() {
 
     return () => {
       try { delete window.widgetStop; } catch {}
-      teardown();
+      teardown(); // ensure full stop on unmount
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -230,7 +233,7 @@ export default function EmbedPage() {
         setTimeout(() => { try { R.start(); } catch {} }, RESTART_BACKOFF_MS);
       } else {
         if (!wantListeningRef.current) setStatus('Turn Mic On to Speak');
-        else setStatus('');
+        else setStatus(''); // speaking/pause
       }
     };
 
@@ -304,9 +307,12 @@ export default function EmbedPage() {
 </speak>`;
   }
 
-  // IMPORTANT: reject on play() failure so speakText() can fallback to WebSpeech
+  // Reject on play() failure so speakText() can fallback to WebSpeech
   async function playAzureTTS(text) {
+    const mySession = sessionRef.current;
     const { token, region } = await getAzureToken();
+    if (mySession !== sessionRef.current) throw new Error('cancelled');
+
     const ttsUrl = `https://${region}.tts.speech.microsoft.com/cognitiveservices/v1`;
     const r = await fetch(ttsUrl, {
       method: 'POST',
@@ -318,8 +324,11 @@ export default function EmbedPage() {
       body: buildSSML(text)
     });
     if (!r.ok) throw new Error('azure tts failed');
+    if (mySession !== sessionRef.current) throw new Error('cancelled');
 
     const buf = await r.arrayBuffer();
+    if (mySession !== sessionRef.current) throw new Error('cancelled');
+
     const blob = new Blob([buf], { type: 'audio/mpeg' });
     const url = URL.createObjectURL(blob);
 
@@ -329,16 +338,23 @@ export default function EmbedPage() {
       const cleanup = () => { if (cleaned) return; cleaned = true; try { URL.revokeObjectURL(url); } catch {} };
 
       try {
+        // If session changed before playback actually starts, abort
+        if (mySession !== sessionRef.current) { cleanup(); return reject(new Error('cancelled')); }
+
         audio.onended = () => { cleanup(); resolve(); };
         audio.onerror = () => { cleanup(); reject(new Error('audio error')); };
+        audio.onplay = () => {
+          if (mySession !== sessionRef.current) { // started after close → stop instantly
+            try { audio.pause(); } catch {}
+            cleanup();
+            reject(new Error('cancelled'));
+          }
+        };
         audio.src = url;
 
         const p = audio.play();
         if (p && typeof p.then === 'function') {
           p.then(() => { /* playing */ }).catch((e) => { cleanup(); reject(e || new Error('play blocked')); });
-        } else {
-          // Older browsers: if it doesn't throw now, assume success
-          // If it fails later, onerror will reject.
         }
       } catch (e) {
         cleanup();
@@ -362,6 +378,8 @@ export default function EmbedPage() {
 
   async function speakText(text) {
     if (!text) return;
+    const mySession = sessionRef.current;
+
     speakingRef.current = true;
     setSpeaking(true);
     setStatus('Speaking');
@@ -369,6 +387,7 @@ export default function EmbedPage() {
     speakGuardUntilRef.current = now() + ECHO_GUARD_BEFORE_MS;
 
     const finish = () => {
+      if (mySession !== sessionRef.current) return; // closed mid-speak; don’t resume
       speakGuardUntilRef.current = now() + ECHO_GUARD_AFTER_MS;
       speakingRef.current = false;
       setSpeaking(false);
@@ -382,7 +401,7 @@ export default function EmbedPage() {
     try {
       if (soundOn) {
         try { await playAzureTTS(text); }
-        catch { await playWebSpeech(text); } // Fallback if Azure play is blocked
+        catch { await playWebSpeech(text); } // fallback if Azure play blocked or cancelled
       } else {
         await new Promise((r) => setTimeout(r, 220));
       }
@@ -499,7 +518,7 @@ export default function EmbedPage() {
   // -------------------- Widget teardown (FULL STOP) --------------------
 
   function teardown() {
-    try { console.log('[Widget] Teardown – stopping all media and timers'); } catch {}
+    sessionRef.current++; // invalidate any pending audio immediately
 
     try { recognizerRef.current?.stop(); } catch {}
     recognizerRef.current = null;
@@ -515,7 +534,12 @@ export default function EmbedPage() {
 
     try {
       const a = audioElRef.current;
-      if (a) { a.pause(); a.src = ''; }
+      if (a) {
+        a.onended = null; a.onerror = null; a.onplay = null;
+        a.pause();
+        a.src = '';
+        try { a.load(); } catch {}
+      }
     } catch {}
 
     try { window.speechSynthesis?.cancel(); } catch {}
@@ -545,14 +569,15 @@ export default function EmbedPage() {
         if (data.type === 'avatar-widget:close') {
           teardown();
         } else if (data.type === 'avatar-widget:open') {
-          // Reopen: turn everything back on and make sure playback is allowed
+          // Reopen fresh: sound+mic on; clear any queued speech; re-arm playback
+          try { window.speechSynthesis?.cancel(); } catch {}
           setSoundOn(true);
           wantListeningRef.current = true;
           setMicOn(true);
           setStatus('Listening');
 
           ensureAudioContextArmed();
-          primeAutoplayUnlock();     // tiny silent ping to ease autoplay restrictions
+          primeAutoplayUnlock();
 
           ensureMicPermission().finally(() => {
             startRecognition(false);
@@ -564,18 +589,18 @@ export default function EmbedPage() {
     window.addEventListener('message', onMessage);
     return () => window.removeEventListener('message', onMessage);
   }, []);
-  // ----------------------------------------------------------------------
 
   // -------------------- UI --------------------
   return (
     <div className="wrap">
       <style>{styles}</style>
-      {/* ... UI stays unchanged ... */}
+
       <div className="top">
         <div className="statusRow">
           <div className={cls('pill', micOn ? (speaking ? 'pillSpeaking' : 'pillOn') : 'pillOff')}>
             {micOn ? (speaking ? 'Speaking' : (status || 'Listening')) : (status || 'Turn Mic On to Speak')}
           </div>
+
           <div className="controls">
             <button className={cls('btn', micOn ? '' : 'btnOff')} onClick={toggleMic} title={micOn ? 'Turn microphone off' : 'Turn microphone on'} aria-label="Toggle microphone">
               <span className="i">🎙️</span><span>{micOn ? 'Mic On' : 'Mic Off'}</span>
@@ -588,6 +613,7 @@ export default function EmbedPage() {
             </button>
           </div>
         </div>
+
         <div className="bars" ref={barsRef} aria-hidden>
           {Array.from({ length: 48 }).map((_, i) => <span key={i} />)}
         </div>
@@ -614,7 +640,6 @@ export default function EmbedPage() {
 }
 
 const styles = `
-/* (same CSS as before) */
 .wrap{display:flex;flex-direction:column;width:100%;height:100%;background:#0B0F19;color:#E6E8EE;font-family:ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial}
 .top{flex:0 0 45%;min-height:180px;padding:14px 14px 8px;display:flex;flex-direction:column}
 .statusRow{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:10px}
