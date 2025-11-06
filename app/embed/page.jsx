@@ -81,6 +81,40 @@ export default function EmbedPage() {
   // Azure token cache
   const azureRef = useRef({ token: null, region: null, exp: 0 });
 
+  // Helper: (re)ensure an AudioContext is present and armed for user unlock if needed
+  function ensureAudioContextArmed() {
+    const audio = audioElRef.current;
+    if (!audio) return;
+    const create = () => {
+      try {
+        const Ctor = (window.AudioContext || window.webkitAudioContext);
+        if (!Ctor) return;
+        const ctx = new Ctor();
+        audioCtxRef.current = ctx;
+        const src = ctx.createMediaElementSource(audio);
+        const analyser = ctx.createAnalyser();
+        analyser.fftSize = 256;
+        src.connect(analyser);
+        analyser.connect(ctx.destination);
+        analyzerRef.current = analyser;
+      } catch {}
+    };
+    if (!audioCtxRef.current) {
+      create();
+    } else {
+      try { audioCtxRef.current.resume(); } catch {}
+    }
+    // If browser blocks autoplay, arm a one-time unlock listener again.
+    const unlock = () => {
+      if (!audioCtxRef.current) create();
+      else try { audioCtxRef.current.resume(); } catch {}
+      window.removeEventListener('pointerdown', unlock);
+      window.removeEventListener('keydown', unlock);
+    };
+    window.addEventListener('pointerdown', unlock, { once: true });
+    window.addEventListener('keydown', unlock, { once: true });
+  }
+
   // -------------------- Mount/init --------------------
 
   useEffect(() => {
@@ -324,7 +358,7 @@ export default function EmbedPage() {
     try {
       if (soundOn) {
         try { await playAzureTTS(text); }
-        catch { await playWebSpeech(text); } // keeps old fallback unless you want to remove it
+        catch { await playWebSpeech(text); }
       } else {
         await new Promise((r) => setTimeout(r, 220));
       }
@@ -488,22 +522,31 @@ export default function EmbedPage() {
     };
   }, []);
 
-  // -------------------- ADDED: listen for host close/open messages --------------------
+  // -------------------- Listen for host close/open messages --------------------
   useEffect(() => {
     function onMessage(evt) {
       try {
         const data = evt?.data;
         if (!data || typeof data !== 'object') return;
+
         if (data.type === 'avatar-widget:close') {
           // Host requests an immediate shutdown
           teardown();
         } else if (data.type === 'avatar-widget:open') {
-          // Optional: auto-start behavior when host opens the widget
-          // ensureMicPermission().finally(() => {
-          //   wantListeningRef.current = true;
-          //   setMicOn(true);
-          //   startRecognition(false);
-          // });
+          // Host reopened the widget: restore defaults and resume listening
+          setSoundOn(true);
+          wantListeningRef.current = true;
+          setMicOn(true);
+          setStatus('Listening');
+
+          // Recreate / arm audio context if it was closed during teardown
+          ensureAudioContextArmed();
+
+          // Make sure mic permissions are ready, then restart recognition
+          ensureMicPermission().finally(() => {
+            startRecognition(false);
+            bumpActivity();
+          });
         }
       } catch {}
     }
