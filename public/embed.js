@@ -125,7 +125,7 @@
     S.open = true;
     emit('opened'); 
     postToFrame('open');
-    postToFrame('kickoff'); // <-- ADDED: cue the iframe to start speaking immediately
+    postToFrame('kickoff'); // cue iframe to start speaking immediately
   }
 
   function close() {
