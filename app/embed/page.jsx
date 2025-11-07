@@ -72,13 +72,15 @@ export default function EmbedPage() {
   // NEW: force first utterance after reopen to use WebSpeech (unblocked)
   const preferWebSpeechOnceRef = useRef(false);
 
+  // Small guard to avoid double kickoffs if host posts both open & kickoff
+  const kickoffSeqRef = useRef(0);
+
   // Voice: prefer server-private env, then public env, else Kim fallback
   const VOICE = useMemo(() => {
     const v =
       process.env.AZURE_TTS_VOICE ||
       process.env.NEXT_PUBLIC_AZURE_TTS_VOICE ||
       'en-AU-KimNeural';
-    // Debug so you can verify at runtime
     try { console.info('[Widget] Using Azure voice:', v); } catch {}
     return v;
   }, []);
@@ -112,7 +114,6 @@ export default function EmbedPage() {
       try { audioCtxRef.current.resume(); } catch {}
     }
 
-    // One-time unlock listeners (if user interacts inside the iframe later)
     const unlock = () => {
       if (!audioCtxRef.current) create();
       else try { audioCtxRef.current.resume(); } catch {}
@@ -300,7 +301,6 @@ export default function EmbedPage() {
 
   function buildSSML(text) {
     const esc = (s) => s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
-    // Note: voice name (Kim) controls accent; xml:lang is non-critical here
     return `<?xml version="1.0"?>
 <speak version="1.0" xml:lang="en-US">
   <voice name="${VOICE}">
@@ -404,7 +404,6 @@ export default function EmbedPage() {
 
     try {
       if (soundOn) {
-        // First utterance after reopen uses WebSpeech to guarantee audio
         if (preferWebSpeechOnceRef.current) {
           preferWebSpeechOnceRef.current = false;
           await playWebSpeech(text);
@@ -566,6 +565,26 @@ export default function EmbedPage() {
     return () => { try { delete window.widgetStop; } catch {} };
   }, []);
 
+  // ---------- NEW: assistant kickoff so it speaks first ----------
+  async function waitForChatId(maxMs = 2000) {
+    const start = now();
+    while (!chatId && now() - start < maxMs) {
+      await new Promise(r => setTimeout(r, 50));
+    }
+    return !!chatId;
+  }
+
+  async function kickoffAssistantFirst(seqToken) {
+    const ok = await waitForChatId(2000);
+    if (!ok) return;
+    // Use a gentle nudge that won't show as user message
+    const reply = await sendToAgent('Hello');
+    // if a newer open happened, abort (session changed)
+    if (seqToken !== kickoffSeqRef.current) return;
+    setMessages((m) => [...m, { role: 'assistant', content: reply }]);
+    await speakText(reply);
+  }
+
   // -------------------- Host messages: close/open --------------------
   useEffect(() => {
     function onMessage(evt) {
@@ -575,10 +594,10 @@ export default function EmbedPage() {
 
         if (data.type === 'avatar-widget:close') {
           teardown();
-        } else if (data.type === 'avatar-widget:open') {
+        } else if (data.type === 'avatar-widget:open' || data.type === 'avatar-widget:kickoff') {
           // Fresh reopen: guarantee next reply speaks
           try { window.speechSynthesis?.cancel(); } catch {}
-          preferWebSpeechOnceRef.current = true; // << force 1st utterance to WebSpeech
+          preferWebSpeechOnceRef.current = true;
 
           setSoundOn(true);
           wantListeningRef.current = true;
@@ -592,12 +611,19 @@ export default function EmbedPage() {
             startRecognition(false);
             bumpActivity();
           });
+
+          // Kick off assistant to speak first (once per open)
+          kickoffSeqRef.current += 1;
+          const token = kickoffSeqRef.current;
+          // Small delay to let audio context/mic settle
+          setTimeout(() => { kickoffAssistantFirst(token); }, 300);
         }
       } catch {}
     }
     window.addEventListener('message', onMessage);
     return () => window.removeEventListener('message', onMessage);
-  }, []);
+  }, [chatId]); // include chatId so kickoff sees latest
+  // ---------------------------------------------------
 
   // -------------------- UI --------------------
   return (
@@ -649,6 +675,7 @@ export default function EmbedPage() {
 }
 
 const styles = `
+/* (unchanged styles) */
 .wrap{display:flex;flex-direction:column;width:100%;height:100%;background:#0B0F19;color:#E6E8EE;font-family:ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial}
 .top{flex:0 0 45%;min-height:180px;padding:14px 14px 8px;display:flex;flex-direction:column}
 .statusRow{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:10px}
