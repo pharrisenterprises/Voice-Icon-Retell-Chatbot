@@ -1,8 +1,8 @@
 /* public/embed.js
  * Voice-only widget loader, dock mode, idempotent.
- * Exposes: window.AvatarWidget = { mount, open, close }
+ * Exposes: window.AvatarWidget = { mount, open, close, gesture }
  * Emits window events: avatar-widget:ready|opened|closed
- * Posts messages into the iframe: {type:'avatar-widget:open'|'avatar-widget:close'}
+ * Posts messages into the iframe: {type:'avatar-widget:open'|'avatar-widget:close'|'avatar-widget:kickoff'}
  */
 (function () {
   var WNS = '__AvatarWidgetState__';
@@ -84,14 +84,12 @@
     container.appendChild(iframe);
     document.body.appendChild(container);
 
+    // PRELOAD iframe so its unlock function exists when user clicks the fab
+    if (!iframe.src) iframe.src = window[WNS].origin + '/embed?autostart=1&layout=compact&videoFirst=1';
+
     document.addEventListener('keydown', function (e) { if (e.key === 'Escape' && !container.classList.contains('avatar-widget-hidden')) API.close(); });
 
     S.elements.container = container; S.elements.header = header; S.elements.iframe = iframe; S.elements.closeBtn = close;
-  }
-
-  function setIframeSrc() {
-    var S = window[WNS], iframe = S.elements.iframe; if (!iframe) return;
-    if (!iframe.src) iframe.src = S.origin + '/embed?autostart=1&layout=compact&videoFirst=1';
   }
 
   function postToFrame(type) {
@@ -121,11 +119,10 @@
     if (S.open) return;
     var c = S.elements.container; if (!c) return;
     c.classList.remove('avatar-widget-hidden');
-    setIframeSrc();
     S.open = true;
     emit('opened');
     postToFrame('open');
-    postToFrame('kickoff'); // <-- ensure iframe kicks off speech on open
+    postToFrame('kickoff');
   }
 
   function close() {
@@ -135,6 +132,16 @@
     emit('closed'); postToFrame('close');
   }
 
-  var API = { mount: mount, open: open, close: close };
+  // NEW: forward the *same-tick user gesture* into the iframe
+  function gesture() {
+    try {
+      var S = window[WNS], f = S.elements.iframe;
+      if (f && f.contentWindow && typeof f.contentWindow.__unlockGestureFromParent === 'function') {
+        f.contentWindow.__unlockGestureFromParent(); // runs in the iframe context synchronously
+      }
+    } catch (e) {}
+  }
+
+  var API = { mount: mount, open: open, close: close, gesture: gesture };
   window.AvatarWidget = API;
 })();
