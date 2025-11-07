@@ -150,7 +150,6 @@ export default function EmbedPage() {
   // -------------------- Mount/init --------------------
   useEffect(() => {
     let auto = false;
-    let greetTimer = 0;
     try {
       const u = new URL(window.location.href);
       const autostartParam = (u.searchParams.get('autostart') || '').toLowerCase();
@@ -198,14 +197,12 @@ export default function EmbedPage() {
     if (auto) {
       ensureMicPermission();
       setTimeout(() => startRecognition(true), 50);
-      greetTimer = window.setTimeout(() => speakLatestAssistant(true), 200);
     }
 
     // expose stop to host immediately
     window.widgetStop = teardown;
 
     return () => {
-      if (greetTimer) clearTimeout(greetTimer);
       try { delete window.widgetStop; } catch {}
       teardown();
     };
@@ -774,7 +771,6 @@ export default function EmbedPage() {
           ensureMicPermission().finally(() => {
             startRecognition(false);
             bumpActivity();
-            setTimeout(() => speakLatestAssistant(true), 150);
           });
         }
       } catch {}
@@ -860,4 +856,3 @@ const styles = `
 .send{flex:0 0 auto;width:38px;height:38px;border-radius:12px;border:1px solid rgba(255,255,255,0.15);background:linear-gradient(180deg,#7cc6ff,#3b82f6);color:white;font-size:16px;cursor:pointer}
 @media (max-width:520px){.top{flex-basis:40%}.bars span{width:calc((100% - 31*4px)/32)}}
 `;
-
