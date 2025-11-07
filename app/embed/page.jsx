@@ -848,3 +848,4 @@ const styles = `
 @media (max-width:520px){.top{flex-basis:40%}.bars span{width:calc((100% - 31*4px)/32)}}
 `;
 
+
