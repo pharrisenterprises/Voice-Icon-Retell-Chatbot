@@ -16,6 +16,7 @@ const IDLE_TIMEOUT_MS = 60_000;
 const ECHO_GUARD_BEFORE_MS = 150;
 const ECHO_GUARD_AFTER_MS = 1200;
 const LISTEN_RESUME_DELAY_MS = 250;
+const INTERRUPT_DELAY_MS = 420;
 
 const RESTART_BACKOFF_MS = 180;
 
@@ -68,6 +69,7 @@ export default function EmbedPage() {
   const speakGuardUntilRef = useRef(0);
   const lastSpokenRef = useRef('');
   const abortSpeakRef = useRef(null);
+  const interruptableAtRef = useRef(0);
 
   const lastActivityRef = useRef(now());
   const idleTimerRef = useRef(0);
@@ -272,6 +274,7 @@ export default function EmbedPage() {
       t = (t || '').trim();
       if (!t) return;
       if (speakingRef.current) {
+        if (now() < interruptableAtRef.current) return;
         if (looksLikeAssistantEcho(t, maxConfidence)) {
           return;
         }
@@ -354,6 +357,7 @@ export default function EmbedPage() {
   function interruptAssistant(_source = 'user') {
     if (!speakingRef.current) return;
     speakGuardUntilRef.current = 0;
+    interruptableAtRef.current = 0;
     if (abortSpeakRef.current) {
       const stop = abortSpeakRef.current;
       abortSpeakRef.current = null;
@@ -446,6 +450,7 @@ export default function EmbedPage() {
     setSpeaking(true);
     setStatus('Speaking');
     speakGuardUntilRef.current = now() + ECHO_GUARD_BEFORE_MS;
+    interruptableAtRef.current = now() + INTERRUPT_DELAY_MS;
 
     let abortReject;
     let abortFired = false;
@@ -466,6 +471,7 @@ export default function EmbedPage() {
       if (mySession !== sessionRef.current) return;
       const guardDelay = abortedByUser ? 0 : ECHO_GUARD_AFTER_MS;
       speakGuardUntilRef.current = now() + guardDelay;
+      interruptableAtRef.current = 0;
       speakingRef.current = false;
       setSpeaking(false);
       if (wantListeningRef.current) {
@@ -689,6 +695,7 @@ export default function EmbedPage() {
     } else {
       stopAllSpeechOutputs();
     }
+    interruptableAtRef.current = 0;
     sessionRef.current++; // invalidate pending audio
 
     try { recognizerRef.current?.stop(); } catch {}
