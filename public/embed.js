@@ -123,7 +123,9 @@
     c.classList.remove('avatar-widget-hidden');
     setIframeSrc();
     S.open = true;
-    emit('opened'); postToFrame('open');
+    emit('opened'); 
+    postToFrame('open');
+    postToFrame('kickoff'); // <-- ADDED: cue the iframe to start speaking immediately
   }
 
   function close() {
