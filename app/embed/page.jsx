@@ -72,11 +72,16 @@ export default function EmbedPage() {
   // NEW: force first utterance after reopen to use WebSpeech (unblocked)
   const preferWebSpeechOnceRef = useRef(false);
 
-  // Voice
-  const VOICE = useMemo(
-    () => (process.env.NEXT_PUBLIC_AZURE_TTS_VOICE || 'en-AU-WilliamNeural'),
-    []
-  );
+  // Voice: prefer server-private env, then public env, else Kim fallback
+  const VOICE = useMemo(() => {
+    const v =
+      process.env.AZURE_TTS_VOICE ||
+      process.env.NEXT_PUBLIC_AZURE_TTS_VOICE ||
+      'en-AU-KimNeural';
+    // Debug so you can verify at runtime
+    try { console.info('[Widget] Using Azure voice:', v); } catch {}
+    return v;
+  }, []);
 
   // Azure token cache
   const azureRef = useRef({ token: null, region: null, exp: 0 });
@@ -295,6 +300,7 @@ export default function EmbedPage() {
 
   function buildSSML(text) {
     const esc = (s) => s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+    // Note: voice name (Kim) controls accent; xml:lang is non-critical here
     return `<?xml version="1.0"?>
 <speak version="1.0" xml:lang="en-US">
   <voice name="${VOICE}">
@@ -398,7 +404,7 @@ export default function EmbedPage() {
 
     try {
       if (soundOn) {
-        // NEW: first utterance after reopen uses WebSpeech to guarantee audio
+        // First utterance after reopen uses WebSpeech to guarantee audio
         if (preferWebSpeechOnceRef.current) {
           preferWebSpeechOnceRef.current = false;
           await playWebSpeech(text);
@@ -604,17 +610,17 @@ export default function EmbedPage() {
             {micOn ? (speaking ? 'Speaking' : (status || 'Listening')) : (status || 'Turn Mic On to Speak')}
           </div>
 
-        <div className="controls">
-          <button className={cls('btn', micOn ? '' : 'btnOff')} onClick={toggleMic} title={micOn ? 'Turn microphone off' : 'Turn microphone on'} aria-label="Toggle microphone">
-            <span className="i">🎙️</span><span>{micOn ? 'Mic On' : 'Mic Off'}</span>
-          </button>
-          <button className={cls('btn', soundOn ? '' : 'btnOff')} onClick={toggleSound} title={soundOn ? 'Mute assistant' : 'Unmute assistant'} aria-label="Toggle sound">
-            <span className="i">🔊</span><span>{soundOn ? 'Sound On' : 'Sound Off'}</span>
-          </button>
-          <button className="btn" onClick={handleRestart} title="Restart conversation" aria-label="Restart conversation">
-            <span className="i">🔄</span><span>Restart</span>
-          </button>
-        </div>
+          <div className="controls">
+            <button className={cls('btn', micOn ? '' : 'btnOff')} onClick={toggleMic} title={micOn ? 'Turn microphone off' : 'Turn microphone on'} aria-label="Toggle microphone">
+              <span className="i">🎙️</span><span>{micOn ? 'Mic On' : 'Mic Off'}</span>
+            </button>
+            <button className={cls('btn', soundOn ? '' : 'btnOff')} onClick={toggleSound} title={soundOn ? 'Mute assistant' : 'Unmute assistant'} aria-label="Toggle sound">
+              <span className="i">🔊</span><span>{soundOn ? 'Sound On' : 'Sound Off'}</span>
+            </button>
+            <button className="btn" onClick={handleRestart} title="Restart conversation" aria-label="Restart conversation">
+              <span className="i">🔄</span><span>Restart</span>
+            </button>
+          </div>
         </div>
 
         <div className="bars" ref={barsRef} aria-hidden>
