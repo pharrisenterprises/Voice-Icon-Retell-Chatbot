@@ -257,17 +257,7 @@ export default function EmbedPage() {
       }
     };
 
-    R.onspeechstart = () => {
-      if (speakingRef.current && now() > speakGuardUntilRef.current) {
-        interruptAssistant('user_speech');
-      }
-    };
-
     R.onresult = (e) => {
-      if (speakingRef.current && now() > speakGuardUntilRef.current) {
-        interruptAssistant('asr_result');
-      }
-      if (now() < speakGuardUntilRef.current || speakingRef.current) return;
       let t = '';
       for (let i = e.resultIndex; i < e.results.length; i++) {
         const res = e.results[i];
@@ -275,6 +265,13 @@ export default function EmbedPage() {
       }
       t = (t || '').trim();
       if (!t) return;
+      if (speakingRef.current) {
+        if (looksLikeAssistantEcho(t)) {
+          return;
+        }
+        interruptAssistant('asr_result');
+      }
+      if (now() < speakGuardUntilRef.current) return;
       handleUserTranscript(t);
     };
 
@@ -509,6 +506,31 @@ export default function EmbedPage() {
     if (!text) return;
     if (!forceRepeat && text === lastSpokenRef.current) return;
     speakText(text);
+  }
+
+  function normalizeTranscript(str) {
+    return (str || '')
+      .toLowerCase()
+      .replace(/[’‘]/g, "'")
+      .replace(/[“”]/g, '"')
+      .replace(/[^a-z0-9'\s]/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+  }
+
+  function looksLikeAssistantEcho(candidate) {
+    const cand = normalizeTranscript(candidate);
+    const last = normalizeTranscript(lastSpokenRef.current || '');
+    if (!cand || !last) return false;
+    if (last.includes(cand)) return true;
+    const candWords = cand.split(' ').filter(Boolean);
+    if (!candWords.length) return false;
+    const lastWords = new Set(last.split(' ').filter(Boolean));
+    let overlap = 0;
+    for (const w of candWords) {
+      if (lastWords.has(w)) overlap += 1;
+    }
+    return overlap / candWords.length >= 0.7;
   }
 
   // -------------------- Chat flow --------------------
