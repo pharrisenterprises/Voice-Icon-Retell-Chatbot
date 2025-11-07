@@ -4,9 +4,9 @@ import React, { useEffect, useMemo, useRef, useState } from 'react';
 
 /**
  * Voice-only widget (Retell text routes + client ASR + Azure/WebSpeech TTS).
- * Key guarantees:
- * - Close (X) stops all audio immediately.
- * - Reopen turns Mic+Sound on and the very next reply SPEAKS (WebSpeech 1st), then Azure after.
+ * Guarantees after this patch:
+ * - On every open: audio context resumes, autoplay is unlocked, chatId awaited, assistant greets via Azure.
+ * - Voice is consistent (Azure). WebSpeech is used silently (volume=0) only to unlock autoplay.
  */
 
 const INITIAL_MIC_ON = true;
@@ -66,16 +66,13 @@ export default function EmbedPage() {
 
   const [speaking, setSpeaking] = useState(false);
 
-  // Guarantees no stale TTS fires after close
+  // Invalidate TTS across closes
   const sessionRef = useRef(0);
 
-  // NEW: force first utterance after reopen to use WebSpeech (unblocked)
-  const preferWebSpeechOnceRef = useRef(false);
-
-  // Small guard to avoid double kickoffs if host posts both open & kickoff
+  // We no longer use audible WebSpeech for first utterance (keeps Azure voice consistent)
   const kickoffSeqRef = useRef(0);
 
-  // Voice: prefer server-private env, then public env, else Kim fallback
+  // Voice name
   const VOICE = useMemo(() => {
     const v =
       process.env.AZURE_TTS_VOICE ||
@@ -137,6 +134,23 @@ export default function EmbedPage() {
     } catch {}
   }
 
+  // **NEW**: silent WebSpeech unlock (keeps Azure as the audible voice)
+  function silentWebSpeechUnlock() {
+    return new Promise((resolve) => {
+      if (!('speechSynthesis' in window)) return resolve();
+      try { window.speechSynthesis.cancel(); } catch {}
+      const u = new SpeechSynthesisUtterance('ok'); // any short text
+      u.volume = 0; // <-- silent
+      u.rate = 1;
+      u.pitch = 1;
+      u.onend = resolve;
+      u.onerror = resolve;
+      try { window.speechSynthesis.speak(u); } catch { resolve(); }
+      // Safety timeout in case events don't fire
+      setTimeout(resolve, 400);
+    });
+  }
+
   // -------------------- Mount/init --------------------
   useEffect(() => {
     let auto = true;
@@ -188,7 +202,6 @@ export default function EmbedPage() {
       setTimeout(() => startRecognition(true), 50);
     }
 
-    // expose stop to host immediately
     window.widgetStop = teardown;
 
     return () => {
@@ -404,13 +417,9 @@ export default function EmbedPage() {
 
     try {
       if (soundOn) {
-        if (preferWebSpeechOnceRef.current) {
-          preferWebSpeechOnceRef.current = false;
-          await playWebSpeech(text);
-        } else {
-          try { await playAzureTTS(text); }
-          catch { await playWebSpeech(text); }
-        }
+        // Always Azure voice for audible speech (consistent voice)
+        try { await playAzureTTS(text); }
+        catch { await playWebSpeech(text); }
       } else {
         await new Promise((r) => setTimeout(r, 220));
       }
@@ -565,8 +574,8 @@ export default function EmbedPage() {
     return () => { try { delete window.widgetStop; } catch {} };
   }, []);
 
-  // ---------- NEW: assistant kickoff so it speaks first ----------
-  async function waitForChatId(maxMs = 2000) {
+  // ---------- Kickoff helpers ----------
+  async function waitForChatId(maxMs = 6000) { // increased from 2000
     const start = now();
     while (!chatId && now() - start < maxMs) {
       await new Promise(r => setTimeout(r, 50));
@@ -575,14 +584,18 @@ export default function EmbedPage() {
   }
 
   async function kickoffAssistantFirst(seqToken) {
-    const ok = await waitForChatId(2000);
+    const ok = await waitForChatId(6000);
     if (!ok) return;
-    // Use a gentle nudge that won't show as user message
+
+    // Autoplay unlocks
+    ensureAudioContextArmed();
+    primeAutoplayUnlock();
+    await silentWebSpeechUnlock(); // silent, keeps Azure as the audible voice
+
     const reply = await sendToAgent('Hello');
-    // if a newer open happened, abort (session changed)
-    if (seqToken !== kickoffSeqRef.current) return;
+    if (seqToken !== kickoffSeqRef.current) return; // newer open happened
     setMessages((m) => [...m, { role: 'assistant', content: reply }]);
-    await speakText(reply);
+    await speakText(reply); // Azure voice
   }
 
   // -------------------- Host messages: close/open --------------------
@@ -595,10 +608,8 @@ export default function EmbedPage() {
         if (data.type === 'avatar-widget:close') {
           teardown();
         } else if (data.type === 'avatar-widget:open' || data.type === 'avatar-widget:kickoff') {
-          // Fresh reopen: guarantee next reply speaks
+          // Prepare audio + mic
           try { window.speechSynthesis?.cancel(); } catch {}
-          preferWebSpeechOnceRef.current = true;
-
           setSoundOn(true);
           wantListeningRef.current = true;
           setMicOn(true);
@@ -609,21 +620,19 @@ export default function EmbedPage() {
 
           ensureMicPermission().finally(() => {
             startRecognition(false);
-            bumpActivity();
           });
 
-          // Kick off assistant to speak first (once per open)
+          // Speak-first kickoff (exactly once per open)
           kickoffSeqRef.current += 1;
           const token = kickoffSeqRef.current;
-          // Small delay to let audio context/mic settle
           setTimeout(() => { kickoffAssistantFirst(token); }, 300);
         }
       } catch {}
     }
     window.addEventListener('message', onMessage);
     return () => window.removeEventListener('message', onMessage);
-  }, [chatId]); // include chatId so kickoff sees latest
-  // ---------------------------------------------------
+  }, [chatId]);
+  // ------------------------------------
 
   // -------------------- UI --------------------
   return (
@@ -675,7 +684,7 @@ export default function EmbedPage() {
 }
 
 const styles = `
-/* (unchanged styles) */
+/* unchanged styles */
 .wrap{display:flex;flex-direction:column;width:100%;height:100%;background:#0B0F19;color:#E6E8EE;font-family:ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial}
 .top{flex:0 0 45%;min-height:180px;padding:14px 14px 8px;display:flex;flex-direction:column}
 .statusRow{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:10px}
