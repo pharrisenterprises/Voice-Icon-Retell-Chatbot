@@ -67,6 +67,7 @@ export default function EmbedPage() {
   const speakingRef = useRef(false);
   const speakGuardUntilRef = useRef(0);
   const lastSpokenRef = useRef('');
+  const abortSpeakRef = useRef(null);
 
   const lastActivityRef = useRef(now());
   const idleTimerRef = useRef(0);
@@ -256,7 +257,16 @@ export default function EmbedPage() {
       }
     };
 
+    R.onspeechstart = () => {
+      if (speakingRef.current && now() > speakGuardUntilRef.current) {
+        interruptAssistant('user_speech');
+      }
+    };
+
     R.onresult = (e) => {
+      if (speakingRef.current && now() > speakGuardUntilRef.current) {
+        interruptAssistant('asr_result');
+      }
       if (now() < speakGuardUntilRef.current || speakingRef.current) return;
       let t = '';
       for (let i = e.resultIndex; i < e.results.length; i++) {
@@ -318,6 +328,42 @@ export default function EmbedPage() {
     </prosody>
   </voice>
 </speak>`;
+  }
+
+  function stopAllSpeechOutputs() {
+    try { window.speechSynthesis?.cancel(); } catch {}
+    const audio = audioElRef.current;
+    if (audio) {
+      const endedHandler = typeof audio.onended === 'function' ? audio.onended : null;
+      const errorHandler = typeof audio.onerror === 'function' ? audio.onerror : null;
+      try { audio.pause(); } catch {}
+      try { audio.currentTime = 0; } catch {}
+      try { audio.src = ''; audio.load(); } catch {}
+      try { audio.onplay = null; audio.onended = null; audio.onerror = null; } catch {}
+      if (endedHandler) {
+        try { endedHandler.call(audio, new Event('ended')); } catch {}
+      } else if (errorHandler) {
+        try { errorHandler.call(audio, new Event('error')); } catch {}
+      }
+    }
+  }
+
+  function interruptAssistant(_source = 'user') {
+    if (!speakingRef.current) return;
+    speakGuardUntilRef.current = 0;
+    if (abortSpeakRef.current) {
+      const stop = abortSpeakRef.current;
+      abortSpeakRef.current = null;
+      stop();
+    } else {
+      stopAllSpeechOutputs();
+    }
+    speakingRef.current = false;
+    setSpeaking(false);
+    setStatus(micOn ? 'Listening' : 'Turn Mic On to Speak');
+    if (wantListeningRef.current) {
+      setTimeout(() => startRecognition(false), LISTEN_RESUME_DELAY_MS);
+    }
   }
 
   async function playAzureTTS(text) {
@@ -391,16 +437,32 @@ export default function EmbedPage() {
     if (!text) return;
     const mySession = sessionRef.current;
     lastSpokenRef.current = text;
+    let abortedByUser = false;
 
     speakingRef.current = true;
     setSpeaking(true);
     setStatus('Speaking');
-    stopRecognition('tts');
     speakGuardUntilRef.current = now() + ECHO_GUARD_BEFORE_MS;
+
+    let abortReject;
+    let abortFired = false;
+    const abortPromise = new Promise((_, reject) => {
+      abortReject = () => {
+        if (abortFired) return;
+        abortFired = true;
+        reject(new Error('aborted'));
+      };
+    });
+    abortSpeakRef.current = () => {
+      abortedByUser = true;
+      stopAllSpeechOutputs();
+      if (abortReject) abortReject();
+    };
 
     const finish = () => {
       if (mySession !== sessionRef.current) return;
-      speakGuardUntilRef.current = now() + ECHO_GUARD_AFTER_MS;
+      const guardDelay = abortedByUser ? 0 : ECHO_GUARD_AFTER_MS;
+      speakGuardUntilRef.current = now() + guardDelay;
       speakingRef.current = false;
       setSpeaking(false);
       if (wantListeningRef.current) {
@@ -412,14 +474,21 @@ export default function EmbedPage() {
 
     try {
       if (soundOnRef.current) {
-        try { await playAzureTTS(text); }
-        catch { await playWebSpeech(text); }
+        try {
+          await Promise.race([playAzureTTS(text), abortPromise]);
+        } catch (err) {
+          if (err?.message === 'aborted') throw err;
+          await Promise.race([playWebSpeech(text), abortPromise]);
+        }
       } else {
-        await new Promise((r) => setTimeout(r, 220));
+        await Promise.race([new Promise((r) => setTimeout(r, 220)), abortPromise]);
       }
-    } catch {
-      // swallow
+    } catch (err) {
+      if (err?.message !== 'aborted') {
+        // swallow other playback failures
+      }
     } finally {
+      abortSpeakRef.current = null;
       finish();
     }
   }
@@ -547,6 +616,13 @@ export default function EmbedPage() {
 
   // -------------------- Teardown --------------------
   function teardown() {
+    if (abortSpeakRef.current) {
+      const stop = abortSpeakRef.current;
+      abortSpeakRef.current = null;
+      stop();
+    } else {
+      stopAllSpeechOutputs();
+    }
     sessionRef.current++; // invalidate pending audio
 
     try { recognizerRef.current?.stop(); } catch {}
