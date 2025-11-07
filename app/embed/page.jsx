@@ -4,12 +4,9 @@ import React, { useEffect, useMemo, useRef, useState } from 'react';
 
 /**
  * Voice-only widget (Retell text routes + client ASR + Azure/WebSpeech TTS).
- * Guarantees after this patch:
- * - On every open: audio context resumes, autoplay is unlocked, chatId awaited, assistant greets via Azure.
- * - Voice is consistent (Azure). WebSpeech is used silently (volume=0) only to unlock autoplay.
- * - On every open: within ~1s the assistant speaks (Azure voice).
- * - On close: speaking stops immediately; pending kickoffs are cancelled.
- * - On reopen: it speaks again, and the same chatId/messages are preserved.
+ * Key guarantees:
+ * - Close (X) stops all audio immediately.
+ * - Reopen turns Mic+Sound on and the very next reply SPEAKS (WebSpeech 1st), then Azure after.
  */
 
 const INITIAL_MIC_ON = true;
@@ -53,6 +50,12 @@ export default function EmbedPage() {
   ]);
   const listRef = useAutoScroll(messages.length);
 
+  const messagesRef = useRef(messages);
+  useEffect(() => { messagesRef.current = messages; }, [messages]);
+
+  const soundOnRef = useRef(INITIAL_SOUND_ON);
+  useEffect(() => { soundOnRef.current = soundOn; }, [soundOn]);
+
   // Audio + ASR
   const audioElRef = useRef(null);
   const audioCtxRef = useRef(null);
@@ -63,27 +66,23 @@ export default function EmbedPage() {
   const wantListeningRef = useRef(INITIAL_MIC_ON);
   const speakingRef = useRef(false);
   const speakGuardUntilRef = useRef(0);
+  const lastSpokenRef = useRef('');
 
   const lastActivityRef = useRef(now());
   const idleTimerRef = useRef(0);
 
   const [speaking, setSpeaking] = useState(false);
 
-  // Invalidate TTS across closes
-  // Global session invalidation and kickoff guards
+  // Guarantees no stale TTS fires after close
   const sessionRef = useRef(0);
 
-  // We no longer use audible WebSpeech for first utterance (keeps Azure voice consistent)
-  const kickoffSeqRef = useRef(0);
-  const kickoffTimerRef = useRef(0);
-
-  // Voice name
-  // Voice
+  // Voice: prefer server-private env, then public env, else Kim fallback
   const VOICE = useMemo(() => {
     const v =
       process.env.AZURE_TTS_VOICE ||
       process.env.NEXT_PUBLIC_AZURE_TTS_VOICE ||
       'en-AU-KimNeural';
+    // Debug so you can verify at runtime
     try { console.info('[Widget] Using Azure voice:', v); } catch {}
     return v;
   }, []);
@@ -92,7 +91,6 @@ export default function EmbedPage() {
   const azureRef = useRef({ token: null, region: null, exp: 0 });
 
   // -------------------- AUDIO helpers --------------------
-  /* -------------------- AUDIO helpers -------------------- */
   function ensureAudioContextArmed() {
     const audio = audioElRef.current;
     if (!audio) return;
@@ -118,7 +116,7 @@ export default function EmbedPage() {
       try { audioCtxRef.current.resume(); } catch {}
     }
 
-    // Also arm on first user gesture inside iframe if needed
+    // One-time unlock listeners (if user interacts inside the iframe later)
     const unlock = () => {
       if (!audioCtxRef.current) create();
       else try { audioCtxRef.current.resume(); } catch {}
@@ -142,30 +140,10 @@ export default function EmbedPage() {
     } catch {}
   }
 
-  // **NEW**: silent WebSpeech unlock (keeps Azure as the audible voice)
-  // Silent WebSpeech unlock (keeps Azure as audible voice)
-  function silentWebSpeechUnlock() {
-    return new Promise((resolve) => {
-      if (!('speechSynthesis' in window)) return resolve();
-      try { window.speechSynthesis.cancel(); } catch {}
-      const u = new SpeechSynthesisUtterance('ok'); // any short text
-      u.volume = 0; // <-- silent
-      u.rate = 1;
-      u.pitch = 1;
-      const u = new SpeechSynthesisUtterance('ok');
-      u.volume = 0;
-      u.onend = resolve;
-      u.onerror = resolve;
-      try { window.speechSynthesis.speak(u); } catch { resolve(); }
-      // Safety timeout in case events don't fire
-      setTimeout(resolve, 400);
-    });
-  }
-
   // -------------------- Mount/init --------------------
-  /* -------------------- Mount/init -------------------- */
   useEffect(() => {
     let auto = true;
+    let greetTimer = 0;
     try {
       const u = new URL(window.location.href);
       auto = (u.searchParams.get('autostart') ?? '1') !== '0';
@@ -188,7 +166,6 @@ export default function EmbedPage() {
     const audio = new Audio();
     audioElRef.current = audio;
 
-    // Pre-arm audio context for smoother first playback
     const unlock = () => {
       if (!audioCtxRef.current) {
         try {
@@ -213,11 +190,14 @@ export default function EmbedPage() {
     if (auto) {
       ensureMicPermission();
       setTimeout(() => startRecognition(true), 50);
+      greetTimer = window.setTimeout(() => speakLatestAssistant(true), 200);
     }
 
+    // expose stop to host immediately
     window.widgetStop = teardown;
 
     return () => {
+      if (greetTimer) clearTimeout(greetTimer);
       try { delete window.widgetStop; } catch {}
       teardown();
     };
@@ -225,7 +205,6 @@ export default function EmbedPage() {
   }, []);
 
   // -------------------- Mic / ASR --------------------
-  /* -------------------- Mic / ASR -------------------- */
   async function ensureMicPermission() {
     try {
       await navigator.mediaDevices.getUserMedia({
@@ -315,7 +294,6 @@ export default function EmbedPage() {
   }
 
   // -------------------- Azure/WebSpeech TTS --------------------
-  /* -------------------- Azure/WebSpeech TTS -------------------- */
   async function getAzureToken() {
     const cache = azureRef.current;
     if (cache.token && cache.exp > now() + 10_000) return cache;
@@ -329,6 +307,7 @@ export default function EmbedPage() {
 
   function buildSSML(text) {
     const esc = (s) => s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+    // Note: voice name (Kim) controls accent; xml:lang is non-critical here
     return `<?xml version="1.0"?>
 <speak version="1.0" xml:lang="en-US">
   <voice name="${VOICE}">
@@ -411,6 +390,7 @@ export default function EmbedPage() {
   async function speakText(text) {
     if (!text) return;
     const mySession = sessionRef.current;
+    lastSpokenRef.current = text;
 
     speakingRef.current = true;
     setSpeaking(true);
@@ -431,9 +411,7 @@ export default function EmbedPage() {
     };
 
     try {
-      if (soundOn) {
-        // Always Azure voice for audible speech (consistent voice)
-        // Always Azure for audible speech; fallback to WebSpeech if Azure fails.
+      if (soundOnRef.current) {
         try { await playAzureTTS(text); }
         catch { await playWebSpeech(text); }
       } else {
@@ -446,8 +424,25 @@ export default function EmbedPage() {
     }
   }
 
+  function latestAssistantContent() {
+    const arr = messagesRef.current || [];
+    for (let i = arr.length - 1; i >= 0; i--) {
+      const m = arr[i];
+      if (m?.role === 'assistant' && typeof m?.content === 'string' && m.content.trim()) {
+        return m.content;
+      }
+    }
+    return '';
+  }
+
+  function speakLatestAssistant(forceRepeat = false) {
+    const text = latestAssistantContent();
+    if (!text) return;
+    if (!forceRepeat && text === lastSpokenRef.current) return;
+    speakText(text);
+  }
+
   // -------------------- Chat flow --------------------
-  /* -------------------- Chat flow -------------------- */
   async function sendToAgent(text) {
     if (!text) return '';
     try {
@@ -481,6 +476,7 @@ export default function EmbedPage() {
   }
 
   function handleRestart() {
+    lastSpokenRef.current = '';
     setMessages([{ role: 'assistant', content: "G’day! I’m Otto 👋  Type below or tap the mic to talk." }]);
     fetch('/api/retell-chat/start', { cache: 'no-store' })
       .then(r => r.json().catch(() => ({})))
@@ -489,6 +485,7 @@ export default function EmbedPage() {
       stopRecognition('restart');
       setTimeout(() => startRecognition(false), 120);
     }
+    setTimeout(() => speakLatestAssistant(true), 120);
   }
 
   function toggleMic() {
@@ -511,7 +508,6 @@ export default function EmbedPage() {
   }
 
   // -------------------- Waveform UI --------------------
-  /* -------------------- Waveform UI -------------------- */
   const barsRef = useRef(null);
   useEffect(() => {
     let raf = 0;
@@ -550,12 +546,8 @@ export default function EmbedPage() {
   }, [speaking]);
 
   // -------------------- Teardown --------------------
-  /* -------------------- Teardown -------------------- */
   function teardown() {
     sessionRef.current++; // invalidate pending audio
-    sessionRef.current++; // cancel pending audio
-    try { clearTimeout(kickoffTimerRef.current || 0); } catch {}
-    kickoffTimerRef.current = 0;
 
     try { recognizerRef.current?.stop(); } catch {}
     recognizerRef.current = null;
@@ -596,39 +588,7 @@ export default function EmbedPage() {
     return () => { try { delete window.widgetStop; } catch {} };
   }, []);
 
-  // ---------- Kickoff helpers ----------
-  async function waitForChatId(maxMs = 6000) { // increased from 2000
-  /* ---------- Kickoff helpers ---------- */
-  async function waitForChatId(maxMs = 6000) {
-    const start = now();
-    while (!chatId && now() - start < maxMs) {
-      await new Promise(r => setTimeout(r, 50));
-    }
-    return !!chatId;
-  }
-
-  async function kickoffAssistantFirst(seqToken) {
-    const ok = await waitForChatId(6000);
-    if (!ok) return;
-    if (!ok || seqToken !== kickoffSeqRef.current) return;
-
-    // Autoplay unlocks
-    // Unlock everything so Azure TTS won't be blocked
-    ensureAudioContextArmed();
-    primeAutoplayUnlock();
-    await silentWebSpeechUnlock(); // silent, keeps Azure as the audible voice
-    await silentWebSpeechUnlock(); // silent unlock, voice stays Azure
-
-    const reply = await sendToAgent('Hello');
-    if (seqToken !== kickoffSeqRef.current) return; // newer open happened
-    if (seqToken !== kickoffSeqRef.current) return; // cancelled/reopened
-    setMessages((m) => [...m, { role: 'assistant', content: reply }]);
-    await speakText(reply); // Azure voice
-    await speakText(reply);
-  }
-
   // -------------------- Host messages: close/open --------------------
-  /* -------------------- Host messages: close/open -------------------- */
   useEffect(() => {
     function onMessage(evt) {
       try {
@@ -637,10 +597,10 @@ export default function EmbedPage() {
 
         if (data.type === 'avatar-widget:close') {
           teardown();
-        } else if (data.type === 'avatar-widget:open' || data.type === 'avatar-widget:kickoff') {
-          // Prepare audio + mic
-          // Prepare audio/mic and schedule kickoff ~1s
+        } else if (data.type === 'avatar-widget:open') {
+          // Fresh reopen: resume conversation with the last assistant turn
           try { window.speechSynthesis?.cancel(); } catch {}
+
           setSoundOn(true);
           wantListeningRef.current = true;
           setMicOn(true);
@@ -651,28 +611,17 @@ export default function EmbedPage() {
 
           ensureMicPermission().finally(() => {
             startRecognition(false);
+            bumpActivity();
+            setTimeout(() => speakLatestAssistant(true), 150);
           });
-
-          // Speak-first kickoff (exactly once per open)
-          // Only once per open; cancel any previous pending kickoff
-          try { clearTimeout(kickoffTimerRef.current || 0); } catch {}
-          kickoffSeqRef.current += 1;
-          const token = kickoffSeqRef.current;
-          setTimeout(() => { kickoffAssistantFirst(token); }, 300);
-          kickoffTimerRef.current = window.setTimeout(() => {
-            kickoffAssistantFirst(token);
-          }, 250); // ~1s total after audio/token unlock
         }
       } catch {}
     }
     window.addEventListener('message', onMessage);
     return () => window.removeEventListener('message', onMessage);
-  }, [chatId]);
-  // ------------------------------------
-  /* ------------------------------------ */
+  }, []);
 
   // -------------------- UI --------------------
-  /* -------------------- UI -------------------- */
   return (
     <div className="wrap">
       <style>{styles}</style>
@@ -694,17 +643,6 @@ export default function EmbedPage() {
               <span className="i">🔄</span><span>Restart</span>
             </button>
           </div>
-        <div className="controls">
-          <button className={cls('btn', micOn ? '' : 'btnOff')} onClick={toggleMic} title={micOn ? 'Turn microphone off' : 'Turn microphone on'} aria-label="Toggle microphone">
-            <span className="i">🎙️</span><span>{micOn ? 'Mic On' : 'Mic Off'}</span>
-          </button>
-          <button className={cls('btn', soundOn ? '' : 'btnOff')} onClick={toggleSound} title={soundOn ? 'Mute assistant' : 'Unmute assistant'} aria-label="Toggle sound">
-            <span className="i">🔊</span><span>{soundOn ? 'Sound On' : 'Sound Off'}</span>
-          </button>
-          <button className="btn" onClick={handleRestart} title="Restart conversation" aria-label="Restart conversation">
-            <span className="i">🔄</span><span>Restart</span>
-          </button>
-        </div>
         </div>
 
         <div className="bars" ref={barsRef} aria-hidden>
@@ -733,7 +671,6 @@ export default function EmbedPage() {
 }
 
 const styles = `
-/* unchanged styles */
 .wrap{display:flex;flex-direction:column;width:100%;height:100%;background:#0B0F19;color:#E6E8EE;font-family:ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial}
 .top{flex:0 0 45%;min-height:180px;padding:14px 14px 8px;display:flex;flex-direction:column}
 .statusRow{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:10px}
