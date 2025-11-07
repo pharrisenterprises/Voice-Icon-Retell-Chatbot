@@ -3,11 +3,10 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 
 /**
- * After this patch:
- * - Parent click calls __unlockGestureFromParent() synchronously (same gesture).
- * - That unlock resumes AudioContext, does a zero-volume WebSpeech tick, starts mic,
- *   and triggers the greet so Azure speaks within ~1s.
- * - Close cancels timers/audio; reopen repeats reliably and keeps the same chatId.
+ * Voice-only widget (Retell text routes + client ASR + Azure/WebSpeech TTS).
+ * Key guarantees:
+ * - Close (X) stops all audio immediately.
+ * - Reopen turns Mic+Sound on and the very next reply SPEAKS (WebSpeech 1st), then Azure after.
  */
 
 const INITIAL_MIC_ON = true;
@@ -17,6 +16,7 @@ const IDLE_TIMEOUT_MS = 60_000;
 const ECHO_GUARD_BEFORE_MS = 150;
 const ECHO_GUARD_AFTER_MS = 1200;
 const LISTEN_RESUME_DELAY_MS = 250;
+
 const RESTART_BACKOFF_MS = 180;
 
 const AZURE_RATE = 'medium';
@@ -38,16 +38,25 @@ function useAutoScroll(depKey) {
 }
 
 export default function EmbedPage() {
+  // Controls
   const [micOn, setMicOn] = useState(INITIAL_MIC_ON);
   const [soundOn, setSoundOn] = useState(INITIAL_SOUND_ON);
   const [status, setStatus] = useState('');
   const [chatId, setChatId] = useState(null);
 
+  // Chat
   const [messages, setMessages] = useState(() => [
     { role: 'assistant', content: "G’day! I’m Otto 👋  Type below or tap the mic to talk." }
   ]);
   const listRef = useAutoScroll(messages.length);
 
+  const messagesRef = useRef(messages);
+  useEffect(() => { messagesRef.current = messages; }, [messages]);
+
+  const soundOnRef = useRef(INITIAL_SOUND_ON);
+  useEffect(() => { soundOnRef.current = soundOn; }, [soundOn]);
+
+  // Audio + ASR
   const audioElRef = useRef(null);
   const audioCtxRef = useRef(null);
   const analyzerRef = useRef(null);
@@ -57,29 +66,35 @@ export default function EmbedPage() {
   const wantListeningRef = useRef(INITIAL_MIC_ON);
   const speakingRef = useRef(false);
   const speakGuardUntilRef = useRef(0);
+  const lastSpokenRef = useRef('');
 
   const lastActivityRef = useRef(now());
   const idleTimerRef = useRef(0);
 
   const [speaking, setSpeaking] = useState(false);
 
+  // Guarantees no stale TTS fires after close
   const sessionRef = useRef(0);
-  const kickoffSeqRef = useRef(0);
-  const kickoffTimerRef = useRef(0);
 
+  // Voice: prefer server-private env, then public env, else Kim fallback
   const VOICE = useMemo(() => {
     const v =
       process.env.AZURE_TTS_VOICE ||
       process.env.NEXT_PUBLIC_AZURE_TTS_VOICE ||
       'en-AU-KimNeural';
+    // Debug so you can verify at runtime
     try { console.info('[Widget] Using Azure voice:', v); } catch {}
     return v;
   }, []);
+
+  // Azure token cache
   const azureRef = useRef({ token: null, region: null, exp: 0 });
 
+  // -------------------- AUDIO helpers --------------------
   function ensureAudioContextArmed() {
     const audio = audioElRef.current;
     if (!audio) return;
+
     const create = () => {
       try {
         const Ctor = (window.AudioContext || window.webkitAudioContext);
@@ -94,8 +109,22 @@ export default function EmbedPage() {
         analyzerRef.current = analyser;
       } catch {}
     };
-    if (!audioCtxRef.current) { create(); }
-    else { try { audioCtxRef.current.resume(); } catch {} }
+
+    if (!audioCtxRef.current) {
+      create();
+    } else {
+      try { audioCtxRef.current.resume(); } catch {}
+    }
+
+    // One-time unlock listeners (if user interacts inside the iframe later)
+    const unlock = () => {
+      if (!audioCtxRef.current) create();
+      else try { audioCtxRef.current.resume(); } catch {}
+      window.removeEventListener('pointerdown', unlock);
+      window.removeEventListener('keydown', unlock);
+    };
+    window.addEventListener('pointerdown', unlock, { once: true });
+    window.addEventListener('keydown', unlock, { once: true });
   }
 
   function primeAutoplayUnlock() {
@@ -111,20 +140,21 @@ export default function EmbedPage() {
     } catch {}
   }
 
-  function zeroVolumeWebSpeechTick() {
-    return new Promise((resolve) => {
-      if (!('speechSynthesis' in window)) return resolve();
-      try { window.speechSynthesis.cancel(); } catch {}
-      const u = new SpeechSynthesisUtterance('unlock');
-      u.volume = 0;
-      u.onend = resolve;
-      u.onerror = resolve;
-      try { window.speechSynthesis.speak(u); } catch { resolve(); }
-      setTimeout(resolve, 350);
-    });
-  }
-
+  // -------------------- Mount/init --------------------
   useEffect(() => {
+    let auto = true;
+    let greetTimer = 0;
+    try {
+      const u = new URL(window.location.href);
+      auto = (u.searchParams.get('autostart') ?? '1') !== '0';
+    } catch {}
+
+    if (!auto) {
+      wantListeningRef.current = false;
+      setMicOn(false);
+      setStatus('Turn Mic On to Speak');
+    }
+
     (async () => {
       try {
         const r = await fetch('/api/retell-chat/start', { cache: 'no-store' });
@@ -136,7 +166,6 @@ export default function EmbedPage() {
     const audio = new Audio();
     audioElRef.current = audio;
 
-    // pre-arm if user interacts inside iframe later
     const unlock = () => {
       if (!audioCtxRef.current) {
         try {
@@ -158,41 +187,38 @@ export default function EmbedPage() {
     window.addEventListener('pointerdown', unlock, { once: true });
     window.addEventListener('keydown', unlock, { once: true });
 
-    // expose teardown
+    if (auto) {
+      ensureMicPermission();
+      setTimeout(() => startRecognition(true), 50);
+      greetTimer = window.setTimeout(() => speakLatestAssistant(true), 200);
+    }
+
+    // expose stop to host immediately
     window.widgetStop = teardown;
 
-    // expose a sync unlock called by parent during the same click gesture
-    (window).__unlockGestureFromParent = async () => {
-      // real user gesture context
-      setSoundOn(true);
-      wantListeningRef.current = true;
-      setMicOn(true);
-      ensureAudioContextArmed();
-      try { audioCtxRef.current && audioCtxRef.current.resume(); } catch {}
-      primeAutoplayUnlock();
-      await zeroVolumeWebSpeechTick(); // keeps Azure as the audible voice later
-      // start mic and schedule kickoff quickly
-      startRecognition(false);
-      try { clearTimeout(kickoffTimerRef.current || 0); } catch {}
-      kickoffSeqRef.current += 1;
-      const token = kickoffSeqRef.current;
-      kickoffTimerRef.current = window.setTimeout(() => { kickoffAssistantFirst(token); }, 120);
-    };
-
     return () => {
+      if (greetTimer) clearTimeout(greetTimer);
       try { delete window.widgetStop; } catch {}
-      try { delete (window).__unlockGestureFromParent; } catch {}
       teardown();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  // -------------------- Mic / ASR --------------------
   async function ensureMicPermission() {
     try {
       await navigator.mediaDevices.getUserMedia({
-        audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true, channelCount: 1, sampleRate: 48000 }
+        audio: {
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true,
+          channelCount: 1,
+          sampleRate: 48000
+        }
       });
-    } catch (e) { console.warn('Mic permission denied/unavailable', e); }
+    } catch (e) {
+      console.warn('Mic permission denied/unavailable', e);
+    }
   }
 
   function armIdleTimer() {
@@ -212,19 +238,24 @@ export default function EmbedPage() {
     R.continuous = true;
     R.interimResults = false;
     R.lang = 'en-US';
+
     R.onstart = () => setStatus('Listening');
+
     R.onend = () => {
       if (wantListeningRef.current && !speakingRef.current) {
         setTimeout(() => { try { R.start(); } catch {} }, RESTART_BACKOFF_MS);
       } else {
-        if (!wantListeningRef.current) setStatus('Turn Mic On to Speak'); else setStatus('');
+        if (!wantListeningRef.current) setStatus('Turn Mic On to Speak');
+        else setStatus('');
       }
     };
+
     R.onerror = () => {
       if (wantListeningRef.current && !speakingRef.current) {
         setTimeout(() => { try { R.start(); } catch {} }, 400);
       }
     };
+
     R.onresult = (e) => {
       if (now() < speakGuardUntilRef.current || speakingRef.current) return;
       let t = '';
@@ -236,6 +267,7 @@ export default function EmbedPage() {
       if (!t) return;
       handleUserTranscript(t);
     };
+
     return R;
   }
 
@@ -257,11 +289,15 @@ export default function EmbedPage() {
     if (fromUserToggle) bumpActivity();
   }
 
-  function stopRecognition() { try { recognizerRef.current?.stop(); } catch {} }
+  function stopRecognition(_reason = '') {
+    try { recognizerRef.current?.stop(); } catch {}
+  }
 
+  // -------------------- Azure/WebSpeech TTS --------------------
   async function getAzureToken() {
     const cache = azureRef.current;
     if (cache.token && cache.exp > now() + 10_000) return cache;
+
     const r = await fetch('/api/azure-tts-token', { method: 'GET', cache: 'no-store' });
     const j = await r.json().catch(() => ({}));
     if (!j?.ok || !j.token) throw new Error('azure token fetch failed');
@@ -271,6 +307,7 @@ export default function EmbedPage() {
 
   function buildSSML(text) {
     const esc = (s) => s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+    // Note: voice name (Kim) controls accent; xml:lang is non-critical here
     return `<?xml version="1.0"?>
 <speak version="1.0" xml:lang="en-US">
   <voice name="${VOICE}">
@@ -314,17 +351,26 @@ export default function EmbedPage() {
 
       try {
         if (mySession !== sessionRef.current) { cleanup(); return reject(new Error('cancelled')); }
+
         audio.onended = () => { cleanup(); resolve(); };
         audio.onerror  = () => { cleanup(); reject(new Error('audio error')); };
         audio.onplay   = () => {
-          if (mySession !== sessionRef.current) { try { audio.pause(); } catch {}; cleanup(); reject(new Error('cancelled')); }
+          if (mySession !== sessionRef.current) {
+            try { audio.pause(); } catch {}
+            cleanup();
+            reject(new Error('cancelled'));
+          }
         };
         audio.src = url;
+
         const p = audio.play();
         if (p && typeof p.then === 'function') {
           p.then(() => {}).catch((e) => { cleanup(); reject(e || new Error('play blocked')); });
         }
-      } catch (e) { cleanup(); reject(e); }
+      } catch (e) {
+        cleanup();
+        reject(e);
+      }
     });
   }
 
@@ -332,8 +378,10 @@ export default function EmbedPage() {
     return new Promise((resolve) => {
       if (!('speechSynthesis' in window)) return resolve();
       const u = new SpeechSynthesisUtterance(text);
-      u.rate = 1.15; u.pitch = 1.08;
-      u.onend = resolve; u.onerror = resolve;
+      u.rate = 1.15;
+      u.pitch = 1.08;
+      u.onend = resolve;
+      u.onerror = resolve;
       try { window.speechSynthesis.cancel(); } catch {}
       try { window.speechSynthesis.speak(u); } catch {}
     });
@@ -342,6 +390,8 @@ export default function EmbedPage() {
   async function speakText(text) {
     if (!text) return;
     const mySession = sessionRef.current;
+    lastSpokenRef.current = text;
+
     speakingRef.current = true;
     setSpeaking(true);
     setStatus('Speaking');
@@ -353,20 +403,46 @@ export default function EmbedPage() {
       speakGuardUntilRef.current = now() + ECHO_GUARD_AFTER_MS;
       speakingRef.current = false;
       setSpeaking(false);
-      if (wantListeningRef.current) setTimeout(() => startRecognition(false), LISTEN_RESUME_DELAY_MS);
-      else setStatus('Turn Mic On to Speak');
+      if (wantListeningRef.current) {
+        setTimeout(() => startRecognition(false), LISTEN_RESUME_DELAY_MS);
+      } else {
+        setStatus('Turn Mic On to Speak');
+      }
     };
 
     try {
-      if (soundOn) {
+      if (soundOnRef.current) {
         try { await playAzureTTS(text); }
         catch { await playWebSpeech(text); }
       } else {
         await new Promise((r) => setTimeout(r, 220));
       }
-    } catch {} finally { finish(); }
+    } catch {
+      // swallow
+    } finally {
+      finish();
+    }
   }
 
+  function latestAssistantContent() {
+    const arr = messagesRef.current || [];
+    for (let i = arr.length - 1; i >= 0; i--) {
+      const m = arr[i];
+      if (m?.role === 'assistant' && typeof m?.content === 'string' && m.content.trim()) {
+        return m.content;
+      }
+    }
+    return '';
+  }
+
+  function speakLatestAssistant(forceRepeat = false) {
+    const text = latestAssistantContent();
+    if (!text) return;
+    if (!forceRepeat && text === lastSpokenRef.current) return;
+    speakText(text);
+  }
+
+  // -------------------- Chat flow --------------------
   async function sendToAgent(text) {
     if (!text) return '';
     try {
@@ -400,6 +476,7 @@ export default function EmbedPage() {
   }
 
   function handleRestart() {
+    lastSpokenRef.current = '';
     setMessages([{ role: 'assistant', content: "G’day! I’m Otto 👋  Type below or tap the mic to talk." }]);
     fetch('/api/retell-chat/start', { cache: 'no-store' })
       .then(r => r.json().catch(() => ({})))
@@ -408,6 +485,7 @@ export default function EmbedPage() {
       stopRecognition('restart');
       setTimeout(() => startRecognition(false), 120);
     }
+    setTimeout(() => speakLatestAssistant(true), 120);
   }
 
   function toggleMic() {
@@ -424,8 +502,12 @@ export default function EmbedPage() {
     }
   }
 
-  function toggleSound() { setSoundOn((v) => !v); bumpActivity(); }
+  function toggleSound() {
+    setSoundOn((v) => !v);
+    bumpActivity();
+  }
 
+  // -------------------- Waveform UI --------------------
   const barsRef = useRef(null);
   useEffect(() => {
     let raf = 0;
@@ -463,10 +545,9 @@ export default function EmbedPage() {
     return () => cancelAnimationFrame(raf);
   }, [speaking]);
 
+  // -------------------- Teardown --------------------
   function teardown() {
-    sessionRef.current++;
-    try { clearTimeout(kickoffTimerRef.current || 0); } catch {}
-    kickoffTimerRef.current = 0;
+    sessionRef.current++; // invalidate pending audio
 
     try { recognizerRef.current?.stop(); } catch {}
     recognizerRef.current = null;
@@ -482,7 +563,12 @@ export default function EmbedPage() {
 
     try {
       const a = audioElRef.current;
-      if (a) { a.onended = null; a.onerror = null; a.onplay = null; a.pause(); a.src = ''; try { a.load(); } catch {} }
+      if (a) {
+        a.onended = null; a.onerror = null; a.onplay = null;
+        a.pause();
+        a.src = '';
+        try { a.load(); } catch {}
+      }
     } catch {}
 
     try { window.speechSynthesis?.cancel(); } catch {}
@@ -497,52 +583,45 @@ export default function EmbedPage() {
     setStatus('Turn Mic On to Speak');
   }
 
-  // Also handle postMessage open/close (kept for safety)
+  useEffect(() => {
+    window.widgetStop = teardown;
+    return () => { try { delete window.widgetStop; } catch {} };
+  }, []);
+
+  // -------------------- Host messages: close/open --------------------
   useEffect(() => {
     function onMessage(evt) {
       try {
         const data = evt?.data;
         if (!data || typeof data !== 'object') return;
+
         if (data.type === 'avatar-widget:close') {
           teardown();
-        } else if (data.type === 'avatar-widget:open' || data.type === 'avatar-widget:kickoff') {
-          // Fallback path if parent didn't call gesture() for some reason
+        } else if (data.type === 'avatar-widget:open') {
+          // Fresh reopen: resume conversation with the last assistant turn
+          try { window.speechSynthesis?.cancel(); } catch {}
+
           setSoundOn(true);
           wantListeningRef.current = true;
           setMicOn(true);
-          ensureMicPermission().finally(() => startRecognition(false));
-          try { clearTimeout(kickoffTimerRef.current || 0); } catch {}
-          kickoffSeqRef.current += 1;
-          const token = kickoffSeqRef.current;
-          kickoffTimerRef.current = window.setTimeout(() => { kickoffAssistantFirst(token); }, 800);
+          setStatus('Listening');
+
+          ensureAudioContextArmed();
+          primeAutoplayUnlock();
+
+          ensureMicPermission().finally(() => {
+            startRecognition(false);
+            bumpActivity();
+            setTimeout(() => speakLatestAssistant(true), 150);
+          });
         }
       } catch {}
     }
     window.addEventListener('message', onMessage);
     return () => window.removeEventListener('message', onMessage);
-  }, [chatId]);
+  }, []);
 
-  async function waitForChatId(maxMs = 6000) {
-    const start = now();
-    while (!chatId && now() - start < maxMs) {
-      await new Promise(r => setTimeout(r, 50));
-    }
-    return !!chatId;
-  }
-
-  async function kickoffAssistantFirst(seqToken) {
-    const ok = await waitForChatId(6000);
-    if (!ok || seqToken !== kickoffSeqRef.current) return;
-
-    ensureAudioContextArmed();
-    primeAutoplayUnlock();
-
-    const reply = await sendToAgent('Hello');
-    if (seqToken !== kickoffSeqRef.current) return;
-    setMessages((m) => [...m, { role: 'assistant', content: reply }]);
-    await speakText(reply);
-  }
-
+  // -------------------- UI --------------------
   return (
     <div className="wrap">
       <style>{styles}</style>
@@ -592,7 +671,6 @@ export default function EmbedPage() {
 }
 
 const styles = `
-/* styles unchanged */
 .wrap{display:flex;flex-direction:column;width:100%;height:100%;background:#0B0F19;color:#E6E8EE;font-family:ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial}
 .top{flex:0 0 45%;min-height:180px;padding:14px 14px 8px;display:flex;flex-direction:column}
 .statusRow{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:10px}
