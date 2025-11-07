@@ -16,12 +16,16 @@ const IDLE_TIMEOUT_MS = 60_000;
 const ECHO_GUARD_BEFORE_MS = 150;
 const ECHO_GUARD_AFTER_MS = 1200;
 const LISTEN_RESUME_DELAY_MS = 250;
+const INTERRUPT_DELAY_MS = 420;
+const FIRST_UTTERANCE_GUARD_MS = 1600;
 
 const RESTART_BACKOFF_MS = 180;
 
 const AZURE_RATE = 'medium';
 const AZURE_PITCH = '+8%';
 const AZURE_STYLE = 'cheerful';
+
+const DEFAULT_GREETING = "G'day! I'm Otto \u{1F44B}  Type below or tap the mic to talk.";
 
 function now() { return Date.now(); }
 function cls(...a) { return a.filter(Boolean).join(' '); }
@@ -46,7 +50,7 @@ export default function EmbedPage() {
 
   // Chat
   const [messages, setMessages] = useState(() => [
-    { role: 'assistant', content: "G’day! I’m Otto 👋  Type below or tap the mic to talk." }
+    { role: 'assistant', content: DEFAULT_GREETING }
   ]);
   const listRef = useAutoScroll(messages.length);
 
@@ -67,6 +71,9 @@ export default function EmbedPage() {
   const speakingRef = useRef(false);
   const speakGuardUntilRef = useRef(0);
   const lastSpokenRef = useRef('');
+  const abortSpeakRef = useRef(null);
+  const interruptableAtRef = useRef(0);
+  const hasSpokenOnceRef = useRef(false);
 
   const lastActivityRef = useRef(now());
   const idleTimerRef = useRef(0);
@@ -142,11 +149,12 @@ export default function EmbedPage() {
 
   // -------------------- Mount/init --------------------
   useEffect(() => {
-    let auto = true;
+    let auto = false;
     let greetTimer = 0;
     try {
       const u = new URL(window.location.href);
-      auto = (u.searchParams.get('autostart') ?? '1') !== '0';
+      const autostartParam = (u.searchParams.get('autostart') || '').toLowerCase();
+      auto = autostartParam === '1' || autostartParam === 'true' || autostartParam === 'yes';
     } catch {}
 
     if (!auto) {
@@ -256,15 +264,34 @@ export default function EmbedPage() {
       }
     };
 
+    R.onspeechstart = () => {
+      if (!speakingRef.current) return;
+      if (now() < interruptableAtRef.current) return;
+      interruptAssistant('speechstart');
+    };
+
     R.onresult = (e) => {
-      if (now() < speakGuardUntilRef.current || speakingRef.current) return;
       let t = '';
+      let maxConfidence = 0;
       for (let i = e.resultIndex; i < e.results.length; i++) {
         const res = e.results[i];
-        if (res.isFinal) t += (res[0]?.transcript || '');
+        if (res.isFinal) {
+          const chunk = res[0]?.transcript || '';
+          if (chunk) t += chunk;
+          const conf = typeof res[0]?.confidence === 'number' ? res[0].confidence : 0;
+          if (conf > maxConfidence) maxConfidence = conf;
+        }
       }
       t = (t || '').trim();
       if (!t) return;
+      if (speakingRef.current) {
+        if (now() < interruptableAtRef.current) return;
+        if (looksLikeAssistantEcho(t, maxConfidence)) {
+          return;
+        }
+        interruptAssistant('asr_result');
+      }
+      if (now() < speakGuardUntilRef.current) return;
       handleUserTranscript(t);
     };
 
@@ -318,6 +345,43 @@ export default function EmbedPage() {
     </prosody>
   </voice>
 </speak>`;
+  }
+
+  function stopAllSpeechOutputs() {
+    try { window.speechSynthesis?.cancel(); } catch {}
+    const audio = audioElRef.current;
+    if (audio) {
+      const endedHandler = typeof audio.onended === 'function' ? audio.onended : null;
+      const errorHandler = typeof audio.onerror === 'function' ? audio.onerror : null;
+      try { audio.pause(); } catch {}
+      try { audio.currentTime = 0; } catch {}
+      try { audio.src = ''; audio.load(); } catch {}
+      try { audio.onplay = null; audio.onended = null; audio.onerror = null; } catch {}
+      if (endedHandler) {
+        try { endedHandler.call(audio, new Event('ended')); } catch {}
+      } else if (errorHandler) {
+        try { errorHandler.call(audio, new Event('error')); } catch {}
+      }
+    }
+  }
+
+  function interruptAssistant(_source = 'user') {
+    if (!speakingRef.current) return;
+    speakGuardUntilRef.current = 0;
+    interruptableAtRef.current = 0;
+    if (abortSpeakRef.current) {
+      const stop = abortSpeakRef.current;
+      abortSpeakRef.current = null;
+      stop();
+    } else {
+      stopAllSpeechOutputs();
+    }
+    speakingRef.current = false;
+    setSpeaking(false);
+    setStatus(micOn ? 'Listening' : 'Turn Mic On to Speak');
+    if (wantListeningRef.current) {
+      setTimeout(() => startRecognition(false), LISTEN_RESUME_DELAY_MS);
+    }
   }
 
   async function playAzureTTS(text) {
@@ -391,16 +455,36 @@ export default function EmbedPage() {
     if (!text) return;
     const mySession = sessionRef.current;
     lastSpokenRef.current = text;
+    let abortedByUser = false;
 
     speakingRef.current = true;
     setSpeaking(true);
     setStatus('Speaking');
-    stopRecognition('tts');
     speakGuardUntilRef.current = now() + ECHO_GUARD_BEFORE_MS;
+    const guard = hasSpokenOnceRef.current ? INTERRUPT_DELAY_MS : FIRST_UTTERANCE_GUARD_MS;
+    interruptableAtRef.current = now() + guard;
+
+    let abortReject;
+    let abortFired = false;
+    const abortPromise = new Promise((_, reject) => {
+      abortReject = () => {
+        if (abortFired) return;
+        abortFired = true;
+        reject(new Error('aborted'));
+      };
+    });
+    abortSpeakRef.current = () => {
+      abortedByUser = true;
+      stopAllSpeechOutputs();
+      if (abortReject) abortReject();
+    };
 
     const finish = () => {
       if (mySession !== sessionRef.current) return;
-      speakGuardUntilRef.current = now() + ECHO_GUARD_AFTER_MS;
+      const guardDelay = abortedByUser ? 0 : ECHO_GUARD_AFTER_MS;
+      speakGuardUntilRef.current = now() + guardDelay;
+      interruptableAtRef.current = 0;
+      hasSpokenOnceRef.current = true;
       speakingRef.current = false;
       setSpeaking(false);
       if (wantListeningRef.current) {
@@ -412,14 +496,21 @@ export default function EmbedPage() {
 
     try {
       if (soundOnRef.current) {
-        try { await playAzureTTS(text); }
-        catch { await playWebSpeech(text); }
+        try {
+          await Promise.race([playAzureTTS(text), abortPromise]);
+        } catch (err) {
+          if (err?.message === 'aborted') throw err;
+          await Promise.race([playWebSpeech(text), abortPromise]);
+        }
       } else {
-        await new Promise((r) => setTimeout(r, 220));
+        await Promise.race([new Promise((r) => setTimeout(r, 220)), abortPromise]);
       }
-    } catch {
-      // swallow
+    } catch (err) {
+      if (err?.message !== 'aborted') {
+        // swallow other playback failures
+      }
     } finally {
+      abortSpeakRef.current = null;
       finish();
     }
   }
@@ -442,6 +533,69 @@ export default function EmbedPage() {
     speakText(text);
   }
 
+  function normalizeTranscript(str) {
+    return (str || '')
+      .toLowerCase()
+      .replace(/[\u2019\u2018]/g, "'")
+      .replace(/[\u201C\u201D]/g, '"')
+      .replace(/[^a-z0-9'\s]/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+  }
+
+  function lcsSimilarity(a, b) {
+    if (!a || !b) return 0;
+    const maxLen = 160;
+    const s1 = a.slice(0, maxLen);
+    const s2 = b.slice(0, maxLen);
+    const dp = Array(s1.length + 1).fill(null).map(() => Array(s2.length + 1).fill(0));
+    for (let i = 1; i <= s1.length; i++) {
+      for (let j = 1; j <= s2.length; j++) {
+        if (s1[i - 1] === s2[j - 1]) dp[i][j] = dp[i - 1][j - 1] + 1;
+        else dp[i][j] = Math.max(dp[i - 1][j], dp[i][j - 1]);
+      }
+    }
+    const lcs = dp[s1.length][s2.length];
+    return lcs / Math.min(s1.length, s2.length);
+  }
+
+  function looksLikeAssistantEcho(candidate, confidence = 1) {
+    const cand = normalizeTranscript(candidate);
+    const last = normalizeTranscript(lastSpokenRef.current || '');
+    if (!cand || !last) return false;
+    if (cand.length <= 3) return true;
+    if (last.includes(cand)) return true;
+
+    const candWords = cand.split(' ').filter(Boolean);
+    if (!candWords.length) return false;
+    const lastCounts = new Map();
+    for (const w of last.split(' ').filter(Boolean)) {
+      lastCounts.set(w, (lastCounts.get(w) || 0) + 1);
+    }
+
+    let overlap = 0;
+    for (const w of candWords) {
+      const count = lastCounts.get(w);
+      if (count) {
+        overlap += 1;
+        if (count === 1) lastCounts.delete(w);
+        else lastCounts.set(w, count - 1);
+      }
+    }
+    const uniqueUserWords = candWords.length - overlap;
+    const overlapRatio = overlap / candWords.length;
+
+    if (candWords.length <= 4 && uniqueUserWords === 0) return true;
+    if (overlapRatio >= 0.8 && uniqueUserWords <= 2) return true;
+    if (confidence < 0.45 && overlapRatio >= 0.5) return true;
+
+    const charSim = lcsSimilarity(cand, last);
+    if (charSim >= 0.82 && uniqueUserWords <= 2) return true;
+    if (candWords.length <= 6 && charSim >= 0.75 && uniqueUserWords === 0) return true;
+
+    return false;
+  }
+
   // -------------------- Chat flow --------------------
   async function sendToAgent(text) {
     if (!text) return '';
@@ -454,7 +608,7 @@ export default function EmbedPage() {
       const j = await r.json().catch(() => ({}));
       if (j?.ok && typeof j.reply === 'string') return j.reply;
     } catch {}
-    return "Sorry—I'm having trouble right now.";
+    return "Sorry\u2014I'm having trouble right now.";
   }
 
   async function handleUserTranscript(text) {
@@ -477,7 +631,7 @@ export default function EmbedPage() {
 
   function handleRestart() {
     lastSpokenRef.current = '';
-    setMessages([{ role: 'assistant', content: "G’day! I’m Otto 👋  Type below or tap the mic to talk." }]);
+    setMessages([{ role: 'assistant', content: DEFAULT_GREETING }]);
     fetch('/api/retell-chat/start', { cache: 'no-store' })
       .then(r => r.json().catch(() => ({})))
       .then(j => { if (j?.ok && j.chatId) setChatId(j.chatId); });
@@ -547,6 +701,14 @@ export default function EmbedPage() {
 
   // -------------------- Teardown --------------------
   function teardown() {
+    if (abortSpeakRef.current) {
+      const stop = abortSpeakRef.current;
+      abortSpeakRef.current = null;
+      stop();
+    } else {
+      stopAllSpeechOutputs();
+    }
+    interruptableAtRef.current = 0;
     sessionRef.current++; // invalidate pending audio
 
     try { recognizerRef.current?.stop(); } catch {}
@@ -634,13 +796,13 @@ export default function EmbedPage() {
 
           <div className="controls">
             <button className={cls('btn', micOn ? '' : 'btnOff')} onClick={toggleMic} title={micOn ? 'Turn microphone off' : 'Turn microphone on'} aria-label="Toggle microphone">
-              <span className="i">🎙️</span><span>{micOn ? 'Mic On' : 'Mic Off'}</span>
+              <span className="i">{'\u{1F399}\uFE0F'}</span><span>{micOn ? 'Mic On' : 'Mic Off'}</span>
             </button>
             <button className={cls('btn', soundOn ? '' : 'btnOff')} onClick={toggleSound} title={soundOn ? 'Mute assistant' : 'Unmute assistant'} aria-label="Toggle sound">
-              <span className="i">🔊</span><span>{soundOn ? 'Sound On' : 'Sound Off'}</span>
+              <span className="i">{'\u{1F50A}'}</span><span>{soundOn ? 'Sound On' : 'Sound Off'}</span>
             </button>
             <button className="btn" onClick={handleRestart} title="Restart conversation" aria-label="Restart conversation">
-              <span className="i">🔄</span><span>Restart</span>
+              <span className="i">{'\u{1F504}'}</span><span>Restart</span>
             </button>
           </div>
         </div>
@@ -652,7 +814,7 @@ export default function EmbedPage() {
 
       <div className="chat">
         <header className="chatHead">
-          <div className="title"><strong>Otto</strong> — <span>Your Auto-Mate!</span></div>
+          <div className="title"><strong>Otto</strong> {'\u2014'} <span>Your Auto-Mate!</span></div>
         </header>
 
         <div className="list" ref={listRef}>
@@ -662,8 +824,8 @@ export default function EmbedPage() {
         </div>
 
         <form className="inputRow" onSubmit={handleSubmit}>
-          <input name="t" className="inp" placeholder={`Type a message… ${micOn ? '(mic is on)' : '(mic is off)'}`} autoComplete="off" onFocus={bumpActivity} onKeyDown={bumpActivity} />
-          <button className="send" aria-label="Send message" title="Send">➤</button>
+          <input name="t" className="inp" placeholder={`Type a message... ${micOn ? '(mic is on)' : '(mic is off)'}`} autoComplete="off" onFocus={bumpActivity} onKeyDown={bumpActivity} />
+          <button className="send" aria-label="Send message" title="Send">{'\u27A4'}</button>
         </form>
       </div>
     </div>
@@ -698,3 +860,4 @@ const styles = `
 .send{flex:0 0 auto;width:38px;height:38px;border-radius:12px;border:1px solid rgba(255,255,255,0.15);background:linear-gradient(180deg,#7cc6ff,#3b82f6);color:white;font-size:16px;cursor:pointer}
 @media (max-width:520px){.top{flex-basis:40%}.bars span{width:calc((100% - 31*4px)/32)}}
 `;
+
