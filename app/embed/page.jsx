@@ -3,10 +3,11 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 
 /**
- * Guarantees after this patch:
- * - On every open: within ~1s the assistant speaks (Azure voice).
- * - On close: speaking stops immediately; pending kickoffs are cancelled.
- * - On reopen: it speaks again, and the same chatId/messages are preserved.
+ * After this patch:
+ * - Parent click calls __unlockGestureFromParent() synchronously (same gesture).
+ * - That unlock resumes AudioContext, does a zero-volume WebSpeech tick, starts mic,
+ *   and triggers the greet so Azure speaks within ~1s.
+ * - Close cancels timers/audio; reopen repeats reliably and keeps the same chatId.
  */
 
 const INITIAL_MIC_ON = true;
@@ -37,19 +38,16 @@ function useAutoScroll(depKey) {
 }
 
 export default function EmbedPage() {
-  // Controls
   const [micOn, setMicOn] = useState(INITIAL_MIC_ON);
   const [soundOn, setSoundOn] = useState(INITIAL_SOUND_ON);
   const [status, setStatus] = useState('');
   const [chatId, setChatId] = useState(null);
 
-  // Chat
   const [messages, setMessages] = useState(() => [
     { role: 'assistant', content: "G’day! I’m Otto 👋  Type below or tap the mic to talk." }
   ]);
   const listRef = useAutoScroll(messages.length);
 
-  // Audio + ASR
   const audioElRef = useRef(null);
   const audioCtxRef = useRef(null);
   const analyzerRef = useRef(null);
@@ -65,12 +63,10 @@ export default function EmbedPage() {
 
   const [speaking, setSpeaking] = useState(false);
 
-  // Global session invalidation and kickoff guards
   const sessionRef = useRef(0);
   const kickoffSeqRef = useRef(0);
   const kickoffTimerRef = useRef(0);
 
-  // Voice
   const VOICE = useMemo(() => {
     const v =
       process.env.AZURE_TTS_VOICE ||
@@ -81,11 +77,9 @@ export default function EmbedPage() {
   }, []);
   const azureRef = useRef({ token: null, region: null, exp: 0 });
 
-  /* -------------------- AUDIO helpers -------------------- */
   function ensureAudioContextArmed() {
     const audio = audioElRef.current;
     if (!audio) return;
-
     const create = () => {
       try {
         const Ctor = (window.AudioContext || window.webkitAudioContext);
@@ -100,22 +94,8 @@ export default function EmbedPage() {
         analyzerRef.current = analyser;
       } catch {}
     };
-
-    if (!audioCtxRef.current) {
-      create();
-    } else {
-      try { audioCtxRef.current.resume(); } catch {}
-    }
-
-    // Also arm on first user gesture inside iframe if needed
-    const unlock = () => {
-      if (!audioCtxRef.current) create();
-      else try { audioCtxRef.current.resume(); } catch {}
-      window.removeEventListener('pointerdown', unlock);
-      window.removeEventListener('keydown', unlock);
-    };
-    window.addEventListener('pointerdown', unlock, { once: true });
-    window.addEventListener('keydown', unlock, { once: true });
+    if (!audioCtxRef.current) { create(); }
+    else { try { audioCtxRef.current.resume(); } catch {} }
   }
 
   function primeAutoplayUnlock() {
@@ -131,21 +111,19 @@ export default function EmbedPage() {
     } catch {}
   }
 
-  // Silent WebSpeech unlock (keeps Azure as audible voice)
-  function silentWebSpeechUnlock() {
+  function zeroVolumeWebSpeechTick() {
     return new Promise((resolve) => {
       if (!('speechSynthesis' in window)) return resolve();
       try { window.speechSynthesis.cancel(); } catch {}
-      const u = new SpeechSynthesisUtterance('ok');
+      const u = new SpeechSynthesisUtterance('unlock');
       u.volume = 0;
       u.onend = resolve;
       u.onerror = resolve;
       try { window.speechSynthesis.speak(u); } catch { resolve(); }
-      setTimeout(resolve, 400);
+      setTimeout(resolve, 350);
     });
   }
 
-  /* -------------------- Mount/init -------------------- */
   useEffect(() => {
     (async () => {
       try {
@@ -158,7 +136,7 @@ export default function EmbedPage() {
     const audio = new Audio();
     audioElRef.current = audio;
 
-    // Pre-arm audio context for smoother first playback
+    // pre-arm if user interacts inside iframe later
     const unlock = () => {
       if (!audioCtxRef.current) {
         try {
@@ -180,29 +158,41 @@ export default function EmbedPage() {
     window.addEventListener('pointerdown', unlock, { once: true });
     window.addEventListener('keydown', unlock, { once: true });
 
+    // expose teardown
     window.widgetStop = teardown;
+
+    // expose a sync unlock called by parent during the same click gesture
+    (window).__unlockGestureFromParent = async () => {
+      // real user gesture context
+      setSoundOn(true);
+      wantListeningRef.current = true;
+      setMicOn(true);
+      ensureAudioContextArmed();
+      try { audioCtxRef.current && audioCtxRef.current.resume(); } catch {}
+      primeAutoplayUnlock();
+      await zeroVolumeWebSpeechTick(); // keeps Azure as the audible voice later
+      // start mic and schedule kickoff quickly
+      startRecognition(false);
+      try { clearTimeout(kickoffTimerRef.current || 0); } catch {}
+      kickoffSeqRef.current += 1;
+      const token = kickoffSeqRef.current;
+      kickoffTimerRef.current = window.setTimeout(() => { kickoffAssistantFirst(token); }, 120);
+    };
+
     return () => {
       try { delete window.widgetStop; } catch {}
+      try { delete (window).__unlockGestureFromParent; } catch {}
       teardown();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  /* -------------------- Mic / ASR -------------------- */
   async function ensureMicPermission() {
     try {
       await navigator.mediaDevices.getUserMedia({
-        audio: {
-          echoCancellation: true,
-          noiseSuppression: true,
-          autoGainControl: true,
-          channelCount: 1,
-          sampleRate: 48000
-        }
+        audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true, channelCount: 1, sampleRate: 48000 }
       });
-    } catch (e) {
-      console.warn('Mic permission denied/unavailable', e);
-    }
+    } catch (e) { console.warn('Mic permission denied/unavailable', e); }
   }
 
   function armIdleTimer() {
@@ -227,8 +217,7 @@ export default function EmbedPage() {
       if (wantListeningRef.current && !speakingRef.current) {
         setTimeout(() => { try { R.start(); } catch {} }, RESTART_BACKOFF_MS);
       } else {
-        if (!wantListeningRef.current) setStatus('Turn Mic On to Speak');
-        else setStatus('');
+        if (!wantListeningRef.current) setStatus('Turn Mic On to Speak'); else setStatus('');
       }
     };
     R.onerror = () => {
@@ -268,15 +257,11 @@ export default function EmbedPage() {
     if (fromUserToggle) bumpActivity();
   }
 
-  function stopRecognition(_reason = '') {
-    try { recognizerRef.current?.stop(); } catch {}
-  }
+  function stopRecognition() { try { recognizerRef.current?.stop(); } catch {} }
 
-  /* -------------------- Azure/WebSpeech TTS -------------------- */
   async function getAzureToken() {
     const cache = azureRef.current;
     if (cache.token && cache.exp > now() + 10_000) return cache;
-
     const r = await fetch('/api/azure-tts-token', { method: 'GET', cache: 'no-store' });
     const j = await r.json().catch(() => ({}));
     if (!j?.ok || !j.token) throw new Error('azure token fetch failed');
@@ -329,26 +314,17 @@ export default function EmbedPage() {
 
       try {
         if (mySession !== sessionRef.current) { cleanup(); return reject(new Error('cancelled')); }
-
         audio.onended = () => { cleanup(); resolve(); };
         audio.onerror  = () => { cleanup(); reject(new Error('audio error')); };
         audio.onplay   = () => {
-          if (mySession !== sessionRef.current) {
-            try { audio.pause(); } catch {}
-            cleanup();
-            reject(new Error('cancelled'));
-          }
+          if (mySession !== sessionRef.current) { try { audio.pause(); } catch {}; cleanup(); reject(new Error('cancelled')); }
         };
         audio.src = url;
-
         const p = audio.play();
         if (p && typeof p.then === 'function') {
           p.then(() => {}).catch((e) => { cleanup(); reject(e || new Error('play blocked')); });
         }
-      } catch (e) {
-        cleanup();
-        reject(e);
-      }
+      } catch (e) { cleanup(); reject(e); }
     });
   }
 
@@ -356,10 +332,8 @@ export default function EmbedPage() {
     return new Promise((resolve) => {
       if (!('speechSynthesis' in window)) return resolve();
       const u = new SpeechSynthesisUtterance(text);
-      u.rate = 1.15;
-      u.pitch = 1.08;
-      u.onend = resolve;
-      u.onerror = resolve;
+      u.rate = 1.15; u.pitch = 1.08;
+      u.onend = resolve; u.onerror = resolve;
       try { window.speechSynthesis.cancel(); } catch {}
       try { window.speechSynthesis.speak(u); } catch {}
     });
@@ -368,7 +342,6 @@ export default function EmbedPage() {
   async function speakText(text) {
     if (!text) return;
     const mySession = sessionRef.current;
-
     speakingRef.current = true;
     setSpeaking(true);
     setStatus('Speaking');
@@ -380,29 +353,20 @@ export default function EmbedPage() {
       speakGuardUntilRef.current = now() + ECHO_GUARD_AFTER_MS;
       speakingRef.current = false;
       setSpeaking(false);
-      if (wantListeningRef.current) {
-        setTimeout(() => startRecognition(false), LISTEN_RESUME_DELAY_MS);
-      } else {
-        setStatus('Turn Mic On to Speak');
-      }
+      if (wantListeningRef.current) setTimeout(() => startRecognition(false), LISTEN_RESUME_DELAY_MS);
+      else setStatus('Turn Mic On to Speak');
     };
 
     try {
       if (soundOn) {
-        // Always Azure for audible speech; fallback to WebSpeech if Azure fails.
         try { await playAzureTTS(text); }
         catch { await playWebSpeech(text); }
       } else {
         await new Promise((r) => setTimeout(r, 220));
       }
-    } catch {
-      // swallow
-    } finally {
-      finish();
-    }
+    } catch {} finally { finish(); }
   }
 
-  /* -------------------- Chat flow -------------------- */
   async function sendToAgent(text) {
     if (!text) return '';
     try {
@@ -460,12 +424,8 @@ export default function EmbedPage() {
     }
   }
 
-  function toggleSound() {
-    setSoundOn((v) => !v);
-    bumpActivity();
-  }
+  function toggleSound() { setSoundOn((v) => !v); bumpActivity(); }
 
-  /* -------------------- Waveform UI -------------------- */
   const barsRef = useRef(null);
   useEffect(() => {
     let raf = 0;
@@ -503,9 +463,8 @@ export default function EmbedPage() {
     return () => cancelAnimationFrame(raf);
   }, [speaking]);
 
-  /* -------------------- Teardown -------------------- */
   function teardown() {
-    sessionRef.current++; // cancel pending audio
+    sessionRef.current++;
     try { clearTimeout(kickoffTimerRef.current || 0); } catch {}
     kickoffTimerRef.current = 0;
 
@@ -523,12 +482,7 @@ export default function EmbedPage() {
 
     try {
       const a = audioElRef.current;
-      if (a) {
-        a.onended = null; a.onerror = null; a.onplay = null;
-        a.pause();
-        a.src = '';
-        try { a.load(); } catch {}
-      }
+      if (a) { a.onended = null; a.onerror = null; a.onplay = null; a.pause(); a.src = ''; try { a.load(); } catch {} }
     } catch {}
 
     try { window.speechSynthesis?.cancel(); } catch {}
@@ -543,12 +497,31 @@ export default function EmbedPage() {
     setStatus('Turn Mic On to Speak');
   }
 
+  // Also handle postMessage open/close (kept for safety)
   useEffect(() => {
-    window.widgetStop = teardown;
-    return () => { try { delete window.widgetStop; } catch {} };
-  }, []);
+    function onMessage(evt) {
+      try {
+        const data = evt?.data;
+        if (!data || typeof data !== 'object') return;
+        if (data.type === 'avatar-widget:close') {
+          teardown();
+        } else if (data.type === 'avatar-widget:open' || data.type === 'avatar-widget:kickoff') {
+          // Fallback path if parent didn't call gesture() for some reason
+          setSoundOn(true);
+          wantListeningRef.current = true;
+          setMicOn(true);
+          ensureMicPermission().finally(() => startRecognition(false));
+          try { clearTimeout(kickoffTimerRef.current || 0); } catch {}
+          kickoffSeqRef.current += 1;
+          const token = kickoffSeqRef.current;
+          kickoffTimerRef.current = window.setTimeout(() => { kickoffAssistantFirst(token); }, 800);
+        }
+      } catch {}
+    }
+    window.addEventListener('message', onMessage);
+    return () => window.removeEventListener('message', onMessage);
+  }, [chatId]);
 
-  /* ---------- Kickoff helpers ---------- */
   async function waitForChatId(maxMs = 6000) {
     const start = now();
     while (!chatId && now() - start < maxMs) {
@@ -561,54 +534,15 @@ export default function EmbedPage() {
     const ok = await waitForChatId(6000);
     if (!ok || seqToken !== kickoffSeqRef.current) return;
 
-    // Unlock everything so Azure TTS won't be blocked
     ensureAudioContextArmed();
     primeAutoplayUnlock();
-    await silentWebSpeechUnlock(); // silent unlock, voice stays Azure
 
     const reply = await sendToAgent('Hello');
-    if (seqToken !== kickoffSeqRef.current) return; // cancelled/reopened
+    if (seqToken !== kickoffSeqRef.current) return;
     setMessages((m) => [...m, { role: 'assistant', content: reply }]);
     await speakText(reply);
   }
 
-  /* -------------------- Host messages: close/open -------------------- */
-  useEffect(() => {
-    function onMessage(evt) {
-      try {
-        const data = evt?.data;
-        if (!data || typeof data !== 'object') return;
-
-        if (data.type === 'avatar-widget:close') {
-          teardown();
-        } else if (data.type === 'avatar-widget:open' || data.type === 'avatar-widget:kickoff') {
-          // Prepare audio/mic and schedule kickoff ~1s
-          try { window.speechSynthesis?.cancel(); } catch {}
-          setSoundOn(true);
-          wantListeningRef.current = true;
-          setMicOn(true);
-          setStatus('Listening');
-
-          ensureMicPermission().finally(() => {
-            startRecognition(false);
-          });
-
-          // Only once per open; cancel any previous pending kickoff
-          try { clearTimeout(kickoffTimerRef.current || 0); } catch {}
-          kickoffSeqRef.current += 1;
-          const token = kickoffSeqRef.current;
-          kickoffTimerRef.current = window.setTimeout(() => {
-            kickoffAssistantFirst(token);
-          }, 250); // ~1s total after audio/token unlock
-        }
-      } catch {}
-    }
-    window.addEventListener('message', onMessage);
-    return () => window.removeEventListener('message', onMessage);
-  }, [chatId]);
-  /* ------------------------------------ */
-
-  /* -------------------- UI -------------------- */
   return (
     <div className="wrap">
       <style>{styles}</style>
@@ -619,17 +553,17 @@ export default function EmbedPage() {
             {micOn ? (speaking ? 'Speaking' : (status || 'Listening')) : (status || 'Turn Mic On to Speak')}
           </div>
 
-        <div className="controls">
-          <button className={cls('btn', micOn ? '' : 'btnOff')} onClick={toggleMic} title={micOn ? 'Turn microphone off' : 'Turn microphone on'} aria-label="Toggle microphone">
-            <span className="i">🎙️</span><span>{micOn ? 'Mic On' : 'Mic Off'}</span>
-          </button>
-          <button className={cls('btn', soundOn ? '' : 'btnOff')} onClick={toggleSound} title={soundOn ? 'Mute assistant' : 'Unmute assistant'} aria-label="Toggle sound">
-            <span className="i">🔊</span><span>{soundOn ? 'Sound On' : 'Sound Off'}</span>
-          </button>
-          <button className="btn" onClick={handleRestart} title="Restart conversation" aria-label="Restart conversation">
-            <span className="i">🔄</span><span>Restart</span>
-          </button>
-        </div>
+          <div className="controls">
+            <button className={cls('btn', micOn ? '' : 'btnOff')} onClick={toggleMic} title={micOn ? 'Turn microphone off' : 'Turn microphone on'} aria-label="Toggle microphone">
+              <span className="i">🎙️</span><span>{micOn ? 'Mic On' : 'Mic Off'}</span>
+            </button>
+            <button className={cls('btn', soundOn ? '' : 'btnOff')} onClick={toggleSound} title={soundOn ? 'Mute assistant' : 'Unmute assistant'} aria-label="Toggle sound">
+              <span className="i">🔊</span><span>{soundOn ? 'Sound On' : 'Sound Off'}</span>
+            </button>
+            <button className="btn" onClick={handleRestart} title="Restart conversation" aria-label="Restart conversation">
+              <span className="i">🔄</span><span>Restart</span>
+            </button>
+          </div>
         </div>
 
         <div className="bars" ref={barsRef} aria-hidden>
@@ -658,6 +592,7 @@ export default function EmbedPage() {
 }
 
 const styles = `
+/* styles unchanged */
 .wrap{display:flex;flex-direction:column;width:100%;height:100%;background:#0B0F19;color:#E6E8EE;font-family:ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial}
 .top{flex:0 0 45%;min-height:180px;padding:14px 14px 8px;display:flex;flex-direction:column}
 .statusRow{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:10px}
