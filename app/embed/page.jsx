@@ -4,9 +4,12 @@ import React, { useEffect, useMemo, useRef, useState } from 'react';
 
 /**
  * Voice-only widget (Retell text routes + client ASR + Azure/WebSpeech TTS).
- * Key guarantees:
- * - Close (X) stops all audio immediately.
- * - Reopen turns Mic+Sound on and the very next reply SPEAKS (WebSpeech 1st), then Azure after.
+ * Guarantees after this patch:
+ * - On every open: audio context resumes, autoplay is unlocked, chatId awaited, assistant greets via Azure.
+ * - Voice is consistent (Azure). WebSpeech is used silently (volume=0) only to unlock autoplay.
+ * - On every open: within ~1s the assistant speaks (Azure voice).
+ * - On close: speaking stops immediately; pending kickoffs are cancelled.
+ * - On reopen: it speaks again, and the same chatId/messages are preserved.
  */
 
 const INITIAL_MIC_ON = true;
@@ -50,12 +53,6 @@ export default function EmbedPage() {
   ]);
   const listRef = useAutoScroll(messages.length);
 
-  const messagesRef = useRef(messages);
-  useEffect(() => { messagesRef.current = messages; }, [messages]);
-
-  const soundOnRef = useRef(INITIAL_SOUND_ON);
-  useEffect(() => { soundOnRef.current = soundOn; }, [soundOn]);
-
   // Audio + ASR
   const audioElRef = useRef(null);
   const audioCtxRef = useRef(null);
@@ -66,24 +63,27 @@ export default function EmbedPage() {
   const wantListeningRef = useRef(INITIAL_MIC_ON);
   const speakingRef = useRef(false);
   const speakGuardUntilRef = useRef(0);
-  const lastSpokenRef = useRef('');
-  const abortSpeakRef = useRef(null);
 
   const lastActivityRef = useRef(now());
   const idleTimerRef = useRef(0);
 
   const [speaking, setSpeaking] = useState(false);
 
-  // Guarantees no stale TTS fires after close
+  // Invalidate TTS across closes
+  // Global session invalidation and kickoff guards
   const sessionRef = useRef(0);
 
-  // Voice: prefer server-private env, then public env, else Kim fallback
+  // We no longer use audible WebSpeech for first utterance (keeps Azure voice consistent)
+  const kickoffSeqRef = useRef(0);
+  const kickoffTimerRef = useRef(0);
+
+  // Voice name
+  // Voice
   const VOICE = useMemo(() => {
     const v =
       process.env.AZURE_TTS_VOICE ||
       process.env.NEXT_PUBLIC_AZURE_TTS_VOICE ||
       'en-AU-KimNeural';
-    // Debug so you can verify at runtime
     try { console.info('[Widget] Using Azure voice:', v); } catch {}
     return v;
   }, []);
@@ -92,6 +92,7 @@ export default function EmbedPage() {
   const azureRef = useRef({ token: null, region: null, exp: 0 });
 
   // -------------------- AUDIO helpers --------------------
+  /* -------------------- AUDIO helpers -------------------- */
   function ensureAudioContextArmed() {
     const audio = audioElRef.current;
     if (!audio) return;
@@ -117,7 +118,7 @@ export default function EmbedPage() {
       try { audioCtxRef.current.resume(); } catch {}
     }
 
-    // One-time unlock listeners (if user interacts inside the iframe later)
+    // Also arm on first user gesture inside iframe if needed
     const unlock = () => {
       if (!audioCtxRef.current) create();
       else try { audioCtxRef.current.resume(); } catch {}
@@ -141,10 +142,30 @@ export default function EmbedPage() {
     } catch {}
   }
 
+  // **NEW**: silent WebSpeech unlock (keeps Azure as the audible voice)
+  // Silent WebSpeech unlock (keeps Azure as audible voice)
+  function silentWebSpeechUnlock() {
+    return new Promise((resolve) => {
+      if (!('speechSynthesis' in window)) return resolve();
+      try { window.speechSynthesis.cancel(); } catch {}
+      const u = new SpeechSynthesisUtterance('ok'); // any short text
+      u.volume = 0; // <-- silent
+      u.rate = 1;
+      u.pitch = 1;
+      const u = new SpeechSynthesisUtterance('ok');
+      u.volume = 0;
+      u.onend = resolve;
+      u.onerror = resolve;
+      try { window.speechSynthesis.speak(u); } catch { resolve(); }
+      // Safety timeout in case events don't fire
+      setTimeout(resolve, 400);
+    });
+  }
+
   // -------------------- Mount/init --------------------
+  /* -------------------- Mount/init -------------------- */
   useEffect(() => {
     let auto = true;
-    let greetTimer = 0;
     try {
       const u = new URL(window.location.href);
       auto = (u.searchParams.get('autostart') ?? '1') !== '0';
@@ -167,6 +188,7 @@ export default function EmbedPage() {
     const audio = new Audio();
     audioElRef.current = audio;
 
+    // Pre-arm audio context for smoother first playback
     const unlock = () => {
       if (!audioCtxRef.current) {
         try {
@@ -191,14 +213,11 @@ export default function EmbedPage() {
     if (auto) {
       ensureMicPermission();
       setTimeout(() => startRecognition(true), 50);
-      greetTimer = window.setTimeout(() => speakLatestAssistant(true), 200);
     }
 
-    // expose stop to host immediately
     window.widgetStop = teardown;
 
     return () => {
-      if (greetTimer) clearTimeout(greetTimer);
       try { delete window.widgetStop; } catch {}
       teardown();
     };
@@ -206,6 +225,7 @@ export default function EmbedPage() {
   }, []);
 
   // -------------------- Mic / ASR --------------------
+  /* -------------------- Mic / ASR -------------------- */
   async function ensureMicPermission() {
     try {
       await navigator.mediaDevices.getUserMedia({
@@ -258,26 +278,14 @@ export default function EmbedPage() {
     };
 
     R.onresult = (e) => {
+      if (now() < speakGuardUntilRef.current || speakingRef.current) return;
       let t = '';
-      let maxConfidence = 0;
       for (let i = e.resultIndex; i < e.results.length; i++) {
         const res = e.results[i];
-        if (res.isFinal) {
-          const chunk = res[0]?.transcript || '';
-          if (chunk) t += chunk;
-          const conf = typeof res[0]?.confidence === 'number' ? res[0].confidence : 0;
-          if (conf > maxConfidence) maxConfidence = conf;
-        }
+        if (res.isFinal) t += (res[0]?.transcript || '');
       }
       t = (t || '').trim();
       if (!t) return;
-      if (speakingRef.current) {
-        if (looksLikeAssistantEcho(t, maxConfidence)) {
-          return;
-        }
-        interruptAssistant('asr_result');
-      }
-      if (now() < speakGuardUntilRef.current) return;
       handleUserTranscript(t);
     };
 
@@ -307,6 +315,7 @@ export default function EmbedPage() {
   }
 
   // -------------------- Azure/WebSpeech TTS --------------------
+  /* -------------------- Azure/WebSpeech TTS -------------------- */
   async function getAzureToken() {
     const cache = azureRef.current;
     if (cache.token && cache.exp > now() + 10_000) return cache;
@@ -320,7 +329,6 @@ export default function EmbedPage() {
 
   function buildSSML(text) {
     const esc = (s) => s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
-    // Note: voice name (Kim) controls accent; xml:lang is non-critical here
     return `<?xml version="1.0"?>
 <speak version="1.0" xml:lang="en-US">
   <voice name="${VOICE}">
@@ -331,42 +339,6 @@ export default function EmbedPage() {
     </prosody>
   </voice>
 </speak>`;
-  }
-
-  function stopAllSpeechOutputs() {
-    try { window.speechSynthesis?.cancel(); } catch {}
-    const audio = audioElRef.current;
-    if (audio) {
-      const endedHandler = typeof audio.onended === 'function' ? audio.onended : null;
-      const errorHandler = typeof audio.onerror === 'function' ? audio.onerror : null;
-      try { audio.pause(); } catch {}
-      try { audio.currentTime = 0; } catch {}
-      try { audio.src = ''; audio.load(); } catch {}
-      try { audio.onplay = null; audio.onended = null; audio.onerror = null; } catch {}
-      if (endedHandler) {
-        try { endedHandler.call(audio, new Event('ended')); } catch {}
-      } else if (errorHandler) {
-        try { errorHandler.call(audio, new Event('error')); } catch {}
-      }
-    }
-  }
-
-  function interruptAssistant(_source = 'user') {
-    if (!speakingRef.current) return;
-    speakGuardUntilRef.current = 0;
-    if (abortSpeakRef.current) {
-      const stop = abortSpeakRef.current;
-      abortSpeakRef.current = null;
-      stop();
-    } else {
-      stopAllSpeechOutputs();
-    }
-    speakingRef.current = false;
-    setSpeaking(false);
-    setStatus(micOn ? 'Listening' : 'Turn Mic On to Speak');
-    if (wantListeningRef.current) {
-      setTimeout(() => startRecognition(false), LISTEN_RESUME_DELAY_MS);
-    }
   }
 
   async function playAzureTTS(text) {
@@ -439,33 +411,16 @@ export default function EmbedPage() {
   async function speakText(text) {
     if (!text) return;
     const mySession = sessionRef.current;
-    lastSpokenRef.current = text;
-    let abortedByUser = false;
 
     speakingRef.current = true;
     setSpeaking(true);
     setStatus('Speaking');
+    stopRecognition('tts');
     speakGuardUntilRef.current = now() + ECHO_GUARD_BEFORE_MS;
-
-    let abortReject;
-    let abortFired = false;
-    const abortPromise = new Promise((_, reject) => {
-      abortReject = () => {
-        if (abortFired) return;
-        abortFired = true;
-        reject(new Error('aborted'));
-      };
-    });
-    abortSpeakRef.current = () => {
-      abortedByUser = true;
-      stopAllSpeechOutputs();
-      if (abortReject) abortReject();
-    };
 
     const finish = () => {
       if (mySession !== sessionRef.current) return;
-      const guardDelay = abortedByUser ? 0 : ECHO_GUARD_AFTER_MS;
-      speakGuardUntilRef.current = now() + guardDelay;
+      speakGuardUntilRef.current = now() + ECHO_GUARD_AFTER_MS;
       speakingRef.current = false;
       setSpeaking(false);
       if (wantListeningRef.current) {
@@ -476,108 +431,23 @@ export default function EmbedPage() {
     };
 
     try {
-      if (soundOnRef.current) {
-        try {
-          await Promise.race([playAzureTTS(text), abortPromise]);
-        } catch (err) {
-          if (err?.message === 'aborted') throw err;
-          await Promise.race([playWebSpeech(text), abortPromise]);
-        }
+      if (soundOn) {
+        // Always Azure voice for audible speech (consistent voice)
+        // Always Azure for audible speech; fallback to WebSpeech if Azure fails.
+        try { await playAzureTTS(text); }
+        catch { await playWebSpeech(text); }
       } else {
-        await Promise.race([new Promise((r) => setTimeout(r, 220)), abortPromise]);
+        await new Promise((r) => setTimeout(r, 220));
       }
-    } catch (err) {
-      if (err?.message !== 'aborted') {
-        // swallow other playback failures
-      }
+    } catch {
+      // swallow
     } finally {
-      abortSpeakRef.current = null;
       finish();
     }
   }
 
-  function latestAssistantContent() {
-    const arr = messagesRef.current || [];
-    for (let i = arr.length - 1; i >= 0; i--) {
-      const m = arr[i];
-      if (m?.role === 'assistant' && typeof m?.content === 'string' && m.content.trim()) {
-        return m.content;
-      }
-    }
-    return '';
-  }
-
-  function speakLatestAssistant(forceRepeat = false) {
-    const text = latestAssistantContent();
-    if (!text) return;
-    if (!forceRepeat && text === lastSpokenRef.current) return;
-    speakText(text);
-  }
-
-  function normalizeTranscript(str) {
-    return (str || '')
-      .toLowerCase()
-      .replace(/[’‘]/g, "'")
-      .replace(/[“”]/g, '"')
-      .replace(/[^a-z0-9'\s]/g, ' ')
-      .replace(/\s+/g, ' ')
-      .trim();
-  }
-
-  function lcsSimilarity(a, b) {
-    if (!a || !b) return 0;
-    const maxLen = 160;
-    const s1 = a.slice(0, maxLen);
-    const s2 = b.slice(0, maxLen);
-    const dp = Array(s1.length + 1).fill(null).map(() => Array(s2.length + 1).fill(0));
-    for (let i = 1; i <= s1.length; i++) {
-      for (let j = 1; j <= s2.length; j++) {
-        if (s1[i - 1] === s2[j - 1]) dp[i][j] = dp[i - 1][j - 1] + 1;
-        else dp[i][j] = Math.max(dp[i - 1][j], dp[i][j - 1]);
-      }
-    }
-    const lcs = dp[s1.length][s2.length];
-    return lcs / Math.min(s1.length, s2.length);
-  }
-
-  function looksLikeAssistantEcho(candidate, confidence = 1) {
-    const cand = normalizeTranscript(candidate);
-    const last = normalizeTranscript(lastSpokenRef.current || '');
-    if (!cand || !last) return false;
-    if (cand.length <= 3) return true;
-    if (last.includes(cand)) return true;
-
-    const candWords = cand.split(' ').filter(Boolean);
-    if (!candWords.length) return false;
-    const lastCounts = new Map();
-    for (const w of last.split(' ').filter(Boolean)) {
-      lastCounts.set(w, (lastCounts.get(w) || 0) + 1);
-    }
-
-    let overlap = 0;
-    for (const w of candWords) {
-      const count = lastCounts.get(w);
-      if (count) {
-        overlap += 1;
-        if (count === 1) lastCounts.delete(w);
-        else lastCounts.set(w, count - 1);
-      }
-    }
-    const uniqueUserWords = candWords.length - overlap;
-    const overlapRatio = overlap / candWords.length;
-
-    if (candWords.length <= 4 && uniqueUserWords === 0) return true;
-    if (overlapRatio >= 0.8 && uniqueUserWords <= 2) return true;
-    if (confidence < 0.45 && overlapRatio >= 0.5) return true;
-
-    const charSim = lcsSimilarity(cand, last);
-    if (charSim >= 0.82 && uniqueUserWords <= 2) return true;
-    if (candWords.length <= 6 && charSim >= 0.75 && uniqueUserWords === 0) return true;
-
-    return false;
-  }
-
   // -------------------- Chat flow --------------------
+  /* -------------------- Chat flow -------------------- */
   async function sendToAgent(text) {
     if (!text) return '';
     try {
@@ -611,7 +481,6 @@ export default function EmbedPage() {
   }
 
   function handleRestart() {
-    lastSpokenRef.current = '';
     setMessages([{ role: 'assistant', content: "G’day! I’m Otto 👋  Type below or tap the mic to talk." }]);
     fetch('/api/retell-chat/start', { cache: 'no-store' })
       .then(r => r.json().catch(() => ({})))
@@ -620,7 +489,6 @@ export default function EmbedPage() {
       stopRecognition('restart');
       setTimeout(() => startRecognition(false), 120);
     }
-    setTimeout(() => speakLatestAssistant(true), 120);
   }
 
   function toggleMic() {
@@ -643,6 +511,7 @@ export default function EmbedPage() {
   }
 
   // -------------------- Waveform UI --------------------
+  /* -------------------- Waveform UI -------------------- */
   const barsRef = useRef(null);
   useEffect(() => {
     let raf = 0;
@@ -681,15 +550,12 @@ export default function EmbedPage() {
   }, [speaking]);
 
   // -------------------- Teardown --------------------
+  /* -------------------- Teardown -------------------- */
   function teardown() {
-    if (abortSpeakRef.current) {
-      const stop = abortSpeakRef.current;
-      abortSpeakRef.current = null;
-      stop();
-    } else {
-      stopAllSpeechOutputs();
-    }
     sessionRef.current++; // invalidate pending audio
+    sessionRef.current++; // cancel pending audio
+    try { clearTimeout(kickoffTimerRef.current || 0); } catch {}
+    kickoffTimerRef.current = 0;
 
     try { recognizerRef.current?.stop(); } catch {}
     recognizerRef.current = null;
@@ -730,7 +596,39 @@ export default function EmbedPage() {
     return () => { try { delete window.widgetStop; } catch {} };
   }, []);
 
+  // ---------- Kickoff helpers ----------
+  async function waitForChatId(maxMs = 6000) { // increased from 2000
+  /* ---------- Kickoff helpers ---------- */
+  async function waitForChatId(maxMs = 6000) {
+    const start = now();
+    while (!chatId && now() - start < maxMs) {
+      await new Promise(r => setTimeout(r, 50));
+    }
+    return !!chatId;
+  }
+
+  async function kickoffAssistantFirst(seqToken) {
+    const ok = await waitForChatId(6000);
+    if (!ok) return;
+    if (!ok || seqToken !== kickoffSeqRef.current) return;
+
+    // Autoplay unlocks
+    // Unlock everything so Azure TTS won't be blocked
+    ensureAudioContextArmed();
+    primeAutoplayUnlock();
+    await silentWebSpeechUnlock(); // silent, keeps Azure as the audible voice
+    await silentWebSpeechUnlock(); // silent unlock, voice stays Azure
+
+    const reply = await sendToAgent('Hello');
+    if (seqToken !== kickoffSeqRef.current) return; // newer open happened
+    if (seqToken !== kickoffSeqRef.current) return; // cancelled/reopened
+    setMessages((m) => [...m, { role: 'assistant', content: reply }]);
+    await speakText(reply); // Azure voice
+    await speakText(reply);
+  }
+
   // -------------------- Host messages: close/open --------------------
+  /* -------------------- Host messages: close/open -------------------- */
   useEffect(() => {
     function onMessage(evt) {
       try {
@@ -739,10 +637,10 @@ export default function EmbedPage() {
 
         if (data.type === 'avatar-widget:close') {
           teardown();
-        } else if (data.type === 'avatar-widget:open') {
-          // Fresh reopen: resume conversation with the last assistant turn
+        } else if (data.type === 'avatar-widget:open' || data.type === 'avatar-widget:kickoff') {
+          // Prepare audio + mic
+          // Prepare audio/mic and schedule kickoff ~1s
           try { window.speechSynthesis?.cancel(); } catch {}
-
           setSoundOn(true);
           wantListeningRef.current = true;
           setMicOn(true);
@@ -753,17 +651,28 @@ export default function EmbedPage() {
 
           ensureMicPermission().finally(() => {
             startRecognition(false);
-            bumpActivity();
-            setTimeout(() => speakLatestAssistant(true), 150);
           });
+
+          // Speak-first kickoff (exactly once per open)
+          // Only once per open; cancel any previous pending kickoff
+          try { clearTimeout(kickoffTimerRef.current || 0); } catch {}
+          kickoffSeqRef.current += 1;
+          const token = kickoffSeqRef.current;
+          setTimeout(() => { kickoffAssistantFirst(token); }, 300);
+          kickoffTimerRef.current = window.setTimeout(() => {
+            kickoffAssistantFirst(token);
+          }, 250); // ~1s total after audio/token unlock
         }
       } catch {}
     }
     window.addEventListener('message', onMessage);
     return () => window.removeEventListener('message', onMessage);
-  }, []);
+  }, [chatId]);
+  // ------------------------------------
+  /* ------------------------------------ */
 
   // -------------------- UI --------------------
+  /* -------------------- UI -------------------- */
   return (
     <div className="wrap">
       <style>{styles}</style>
@@ -785,6 +694,17 @@ export default function EmbedPage() {
               <span className="i">🔄</span><span>Restart</span>
             </button>
           </div>
+        <div className="controls">
+          <button className={cls('btn', micOn ? '' : 'btnOff')} onClick={toggleMic} title={micOn ? 'Turn microphone off' : 'Turn microphone on'} aria-label="Toggle microphone">
+            <span className="i">🎙️</span><span>{micOn ? 'Mic On' : 'Mic Off'}</span>
+          </button>
+          <button className={cls('btn', soundOn ? '' : 'btnOff')} onClick={toggleSound} title={soundOn ? 'Mute assistant' : 'Unmute assistant'} aria-label="Toggle sound">
+            <span className="i">🔊</span><span>{soundOn ? 'Sound On' : 'Sound Off'}</span>
+          </button>
+          <button className="btn" onClick={handleRestart} title="Restart conversation" aria-label="Restart conversation">
+            <span className="i">🔄</span><span>Restart</span>
+          </button>
+        </div>
         </div>
 
         <div className="bars" ref={barsRef} aria-hidden>
@@ -813,6 +733,7 @@ export default function EmbedPage() {
 }
 
 const styles = `
+/* unchanged styles */
 .wrap{display:flex;flex-direction:column;width:100%;height:100%;background:#0B0F19;color:#E6E8EE;font-family:ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial}
 .top{flex:0 0 45%;min-height:180px;padding:14px 14px 8px;display:flex;flex-direction:column}
 .statusRow{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:10px}
