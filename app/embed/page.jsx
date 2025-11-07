@@ -17,6 +17,7 @@ const ECHO_GUARD_BEFORE_MS = 150;
 const ECHO_GUARD_AFTER_MS = 1200;
 const LISTEN_RESUME_DELAY_MS = 250;
 const INTERRUPT_DELAY_MS = 420;
+const FIRST_UTTERANCE_GUARD_MS = 1600;
 
 const RESTART_BACKOFF_MS = 180;
 
@@ -70,6 +71,10 @@ export default function EmbedPage() {
   const lastSpokenRef = useRef('');
   const abortSpeakRef = useRef(null);
   const interruptableAtRef = useRef(0);
+  const hasSpokenOnceRef = useRef(false);
+
+  // FIX: explicit open-state gate — TTS won’t run unless this is true
+  const openedRef = useRef(false);
 
   const lastActivityRef = useRef(now());
   const idleTimerRef = useRef(0);
@@ -85,7 +90,6 @@ export default function EmbedPage() {
       process.env.AZURE_TTS_VOICE ||
       process.env.NEXT_PUBLIC_AZURE_TTS_VOICE ||
       'en-AU-KimNeural';
-    // Debug so you can verify at runtime
     try { console.info('[Widget] Using Azure voice:', v); } catch {}
     return v;
   }, []);
@@ -119,7 +123,6 @@ export default function EmbedPage() {
       try { audioCtxRef.current.resume(); } catch {}
     }
 
-    // One-time unlock listeners (if user interacts inside the iframe later)
     const unlock = () => {
       if (!audioCtxRef.current) create();
       else try { audioCtxRef.current.resume(); } catch {}
@@ -157,6 +160,9 @@ export default function EmbedPage() {
       wantListeningRef.current = false;
       setMicOn(false);
       setStatus('Turn Mic On to Speak');
+      openedRef.current = false; // FIX: ensure closed by default
+    } else {
+      openedRef.current = true;   // FIX: allow auto start only when explicitly requested
     }
 
     (async () => {
@@ -259,7 +265,11 @@ export default function EmbedPage() {
         setTimeout(() => { try { R.start(); } catch {} }, 400);
       }
     };
-
+    R.onspeechstart = () => {
+      if (!speakingRef.current) return;
+      if (now() < interruptableAtRef.current) return;
+      interruptAssistant('speechstart');
+    };
     R.onresult = (e) => {
       let t = '';
       let maxConfidence = 0;
@@ -324,7 +334,6 @@ export default function EmbedPage() {
 
   function buildSSML(text) {
     const esc = (s) => s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
-    // Note: voice name (Kim) controls accent; xml:lang is non-critical here
     return `<?xml version="1.0"?>
 <speak version="1.0" xml:lang="en-US">
   <voice name="${VOICE}">
@@ -442,7 +451,10 @@ export default function EmbedPage() {
   }
 
   async function speakText(text) {
+    // FIX: Do not speak unless widget is OPEN and sound is ON
+    if (!openedRef.current || !soundOnRef.current) return;
     if (!text) return;
+
     const mySession = sessionRef.current;
     lastSpokenRef.current = text;
     let abortedByUser = false;
@@ -494,9 +506,7 @@ export default function EmbedPage() {
         await Promise.race([new Promise((r) => setTimeout(r, 220)), abortPromise]);
       }
     } catch (err) {
-      if (err?.message !== 'aborted') {
-        // swallow other playback failures
-      }
+      // swallow non-abort errors
     } finally {
       abortSpeakRef.current = null;
       finish();
@@ -515,6 +525,8 @@ export default function EmbedPage() {
   }
 
   function speakLatestAssistant(forceRepeat = false) {
+    // FIX: respect open gate
+    if (!openedRef.current) return;
     const text = latestAssistantContent();
     if (!text) return;
     if (!forceRepeat && text === lastSpokenRef.current) return;
@@ -731,6 +743,9 @@ export default function EmbedPage() {
     setSpeaking(false);
     setSoundOn(false);
     setStatus('Turn Mic On to Speak');
+
+    // FIX: mark as closed so nothing speaks until explicit open
+    openedRef.current = false;
   }
 
   useEffect(() => {
@@ -747,7 +762,10 @@ export default function EmbedPage() {
 
         if (data.type === 'avatar-widget:close') {
           teardown();
+          openedRef.current = false; // FIX
         } else if (data.type === 'avatar-widget:open') {
+          openedRef.current = true;  // FIX: allow speaking only after open
+
           // Fresh reopen: resume conversation with the last assistant turn
           try { window.speechSynthesis?.cancel(); } catch {}
 
@@ -848,4 +866,3 @@ const styles = `
 .send{flex:0 0 auto;width:38px;height:38px;border-radius:12px;border:1px solid rgba(255,255,255,0.15);background:linear-gradient(180deg,#7cc6ff,#3b82f6);color:white;font-size:16px;cursor:pointer}
 @media (max-width:520px){.top{flex-basis:40%}.bars span{width:calc((100% - 31*4px)/32)}}
 `;
-
