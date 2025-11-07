@@ -16,8 +16,6 @@ const IDLE_TIMEOUT_MS = 60_000;
 const ECHO_GUARD_BEFORE_MS = 150;
 const ECHO_GUARD_AFTER_MS = 1200;
 const LISTEN_RESUME_DELAY_MS = 250;
-const INTERRUPT_DELAY_MS = 420;
-const FIRST_UTTERANCE_GUARD_MS = 1600;
 
 const RESTART_BACKOFF_MS = 180;
 
@@ -70,8 +68,6 @@ export default function EmbedPage() {
   const speakGuardUntilRef = useRef(0);
   const lastSpokenRef = useRef('');
   const abortSpeakRef = useRef(null);
-  const interruptableAtRef = useRef(0);
-  const hasSpokenOnceRef = useRef(false);
 
   const lastActivityRef = useRef(now());
   const idleTimerRef = useRef(0);
@@ -80,9 +76,6 @@ export default function EmbedPage() {
 
   // Guarantees no stale TTS fires after close
   const sessionRef = useRef(0);
-
-  // NEW: gate speech until widget is explicitly opened
-  const openedRef = useRef(false);
 
   // Voice: prefer server-private env, then public env, else Kim fallback
   const VOICE = useMemo(() => {
@@ -150,12 +143,11 @@ export default function EmbedPage() {
 
   // -------------------- Mount/init --------------------
   useEffect(() => {
-    let auto = false;
+    let auto = true;
     let greetTimer = 0;
     try {
       const u = new URL(window.location.href);
-      const autostartParam = (u.searchParams.get('autostart') || '').toLowerCase();
-      auto = autostartParam === '1' || autostartParam === 'true' || autostartParam === 'yes';
+      auto = (u.searchParams.get('autostart') ?? '1') !== '0';
     } catch {}
 
     if (!auto) {
@@ -264,11 +256,7 @@ export default function EmbedPage() {
         setTimeout(() => { try { R.start(); } catch {} }, 400);
       }
     };
-    R.onspeechstart = () => {
-      if (!speakingRef.current) return;
-      if (now() < interruptableAtRef.current) return;
-      interruptAssistant('speechstart');
-    };
+
     R.onresult = (e) => {
       let t = '';
       let maxConfidence = 0;
@@ -284,7 +272,6 @@ export default function EmbedPage() {
       t = (t || '').trim();
       if (!t) return;
       if (speakingRef.current) {
-        if (now() < interruptableAtRef.current) return;
         if (looksLikeAssistantEcho(t, maxConfidence)) {
           return;
         }
@@ -367,7 +354,6 @@ export default function EmbedPage() {
   function interruptAssistant(_source = 'user') {
     if (!speakingRef.current) return;
     speakGuardUntilRef.current = 0;
-    interruptableAtRef.current = 0;
     if (abortSpeakRef.current) {
       const stop = abortSpeakRef.current;
       abortSpeakRef.current = null;
@@ -396,7 +382,7 @@ export default function EmbedPage() {
         'Content-Type': 'application/ssml+xml',
         'X-Microsoft-OutputFormat': 'audio-24khz-48kbitrate-mono-mp3'
       },
-        body: buildSSML(text)
+      body: buildSSML(text)
     });
     if (!r.ok) throw new Error('azure tts failed');
     if (mySession !== sessionRef.current) throw new Error('cancelled');
@@ -451,9 +437,6 @@ export default function EmbedPage() {
   }
 
   async function speakText(text) {
-    // NEW: do not speak unless the widget has been explicitly opened
-    if (!openedRef.current) return;
-
     if (!text) return;
     const mySession = sessionRef.current;
     lastSpokenRef.current = text;
@@ -463,7 +446,6 @@ export default function EmbedPage() {
     setSpeaking(true);
     setStatus('Speaking');
     speakGuardUntilRef.current = now() + ECHO_GUARD_BEFORE_MS;
-    interruptableAtRef.current = now() + INTERRUPT_DELAY_MS;
 
     let abortReject;
     let abortFired = false;
@@ -484,7 +466,6 @@ export default function EmbedPage() {
       if (mySession !== sessionRef.current) return;
       const guardDelay = abortedByUser ? 0 : ECHO_GUARD_AFTER_MS;
       speakGuardUntilRef.current = now() + guardDelay;
-      interruptableAtRef.current = 0;
       speakingRef.current = false;
       setSpeaking(false);
       if (wantListeningRef.current) {
@@ -527,9 +508,6 @@ export default function EmbedPage() {
   }
 
   function speakLatestAssistant(forceRepeat = false) {
-    // NEW: respect open gate
-    if (!openedRef.current) return;
-
     const text = latestAssistantContent();
     if (!text) return;
     if (!forceRepeat && text === lastSpokenRef.current) return;
@@ -711,7 +689,6 @@ export default function EmbedPage() {
     } else {
       stopAllSpeechOutputs();
     }
-    interruptableAtRef.current = 0;
     sessionRef.current++; // invalidate pending audio
 
     try { recognizerRef.current?.stop(); } catch {}
@@ -746,9 +723,6 @@ export default function EmbedPage() {
     setSpeaking(false);
     setSoundOn(false);
     setStatus('Turn Mic On to Speak');
-
-    // NEW: mark closed so no speech can fire post-teardown
-    openedRef.current = false;
   }
 
   useEffect(() => {
@@ -765,10 +739,7 @@ export default function EmbedPage() {
 
         if (data.type === 'avatar-widget:close') {
           teardown();
-          openedRef.current = false; // NEW
         } else if (data.type === 'avatar-widget:open') {
-          openedRef.current = true;  // NEW
-
           // Fresh reopen: resume conversation with the last assistant turn
           try { window.speechSynthesis?.cancel(); } catch {}
 
