@@ -123,9 +123,9 @@
     c.classList.remove('avatar-widget-hidden');
     setIframeSrc();
     S.open = true;
-    emit('opened'); 
+    emit('opened');
     postToFrame('open');
-    postToFrame('kickoff'); // cue iframe to start speaking immediately
+    postToFrame('kickoff'); // <-- ensure iframe kicks off speech on open
   }
 
   function close() {
