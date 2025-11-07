@@ -3,10 +3,10 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 
 /**
- * Voice-only widget (Retell text routes + client ASR + Azure/WebSpeech TTS).
  * Guarantees after this patch:
- * - On every open: audio context resumes, autoplay is unlocked, chatId awaited, assistant greets via Azure.
- * - Voice is consistent (Azure). WebSpeech is used silently (volume=0) only to unlock autoplay.
+ * - On every open: within ~1s the assistant speaks (Azure voice).
+ * - On close: speaking stops immediately; pending kickoffs are cancelled.
+ * - On reopen: it speaks again, and the same chatId/messages are preserved.
  */
 
 const INITIAL_MIC_ON = true;
@@ -16,7 +16,6 @@ const IDLE_TIMEOUT_MS = 60_000;
 const ECHO_GUARD_BEFORE_MS = 150;
 const ECHO_GUARD_AFTER_MS = 1200;
 const LISTEN_RESUME_DELAY_MS = 250;
-
 const RESTART_BACKOFF_MS = 180;
 
 const AZURE_RATE = 'medium';
@@ -66,13 +65,12 @@ export default function EmbedPage() {
 
   const [speaking, setSpeaking] = useState(false);
 
-  // Invalidate TTS across closes
+  // Global session invalidation and kickoff guards
   const sessionRef = useRef(0);
-
-  // We no longer use audible WebSpeech for first utterance (keeps Azure voice consistent)
   const kickoffSeqRef = useRef(0);
+  const kickoffTimerRef = useRef(0);
 
-  // Voice name
+  // Voice
   const VOICE = useMemo(() => {
     const v =
       process.env.AZURE_TTS_VOICE ||
@@ -81,11 +79,9 @@ export default function EmbedPage() {
     try { console.info('[Widget] Using Azure voice:', v); } catch {}
     return v;
   }, []);
-
-  // Azure token cache
   const azureRef = useRef({ token: null, region: null, exp: 0 });
 
-  // -------------------- AUDIO helpers --------------------
+  /* -------------------- AUDIO helpers -------------------- */
   function ensureAudioContextArmed() {
     const audio = audioElRef.current;
     if (!audio) return;
@@ -111,6 +107,7 @@ export default function EmbedPage() {
       try { audioCtxRef.current.resume(); } catch {}
     }
 
+    // Also arm on first user gesture inside iframe if needed
     const unlock = () => {
       if (!audioCtxRef.current) create();
       else try { audioCtxRef.current.resume(); } catch {}
@@ -134,37 +131,22 @@ export default function EmbedPage() {
     } catch {}
   }
 
-  // **NEW**: silent WebSpeech unlock (keeps Azure as the audible voice)
+  // Silent WebSpeech unlock (keeps Azure as audible voice)
   function silentWebSpeechUnlock() {
     return new Promise((resolve) => {
       if (!('speechSynthesis' in window)) return resolve();
       try { window.speechSynthesis.cancel(); } catch {}
-      const u = new SpeechSynthesisUtterance('ok'); // any short text
-      u.volume = 0; // <-- silent
-      u.rate = 1;
-      u.pitch = 1;
+      const u = new SpeechSynthesisUtterance('ok');
+      u.volume = 0;
       u.onend = resolve;
       u.onerror = resolve;
       try { window.speechSynthesis.speak(u); } catch { resolve(); }
-      // Safety timeout in case events don't fire
       setTimeout(resolve, 400);
     });
   }
 
-  // -------------------- Mount/init --------------------
+  /* -------------------- Mount/init -------------------- */
   useEffect(() => {
-    let auto = true;
-    try {
-      const u = new URL(window.location.href);
-      auto = (u.searchParams.get('autostart') ?? '1') !== '0';
-    } catch {}
-
-    if (!auto) {
-      wantListeningRef.current = false;
-      setMicOn(false);
-      setStatus('Turn Mic On to Speak');
-    }
-
     (async () => {
       try {
         const r = await fetch('/api/retell-chat/start', { cache: 'no-store' });
@@ -176,6 +158,7 @@ export default function EmbedPage() {
     const audio = new Audio();
     audioElRef.current = audio;
 
+    // Pre-arm audio context for smoother first playback
     const unlock = () => {
       if (!audioCtxRef.current) {
         try {
@@ -197,13 +180,7 @@ export default function EmbedPage() {
     window.addEventListener('pointerdown', unlock, { once: true });
     window.addEventListener('keydown', unlock, { once: true });
 
-    if (auto) {
-      ensureMicPermission();
-      setTimeout(() => startRecognition(true), 50);
-    }
-
     window.widgetStop = teardown;
-
     return () => {
       try { delete window.widgetStop; } catch {}
       teardown();
@@ -211,7 +188,7 @@ export default function EmbedPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // -------------------- Mic / ASR --------------------
+  /* -------------------- Mic / ASR -------------------- */
   async function ensureMicPermission() {
     try {
       await navigator.mediaDevices.getUserMedia({
@@ -245,9 +222,7 @@ export default function EmbedPage() {
     R.continuous = true;
     R.interimResults = false;
     R.lang = 'en-US';
-
     R.onstart = () => setStatus('Listening');
-
     R.onend = () => {
       if (wantListeningRef.current && !speakingRef.current) {
         setTimeout(() => { try { R.start(); } catch {} }, RESTART_BACKOFF_MS);
@@ -256,13 +231,11 @@ export default function EmbedPage() {
         else setStatus('');
       }
     };
-
     R.onerror = () => {
       if (wantListeningRef.current && !speakingRef.current) {
         setTimeout(() => { try { R.start(); } catch {} }, 400);
       }
     };
-
     R.onresult = (e) => {
       if (now() < speakGuardUntilRef.current || speakingRef.current) return;
       let t = '';
@@ -274,7 +247,6 @@ export default function EmbedPage() {
       if (!t) return;
       handleUserTranscript(t);
     };
-
     return R;
   }
 
@@ -300,7 +272,7 @@ export default function EmbedPage() {
     try { recognizerRef.current?.stop(); } catch {}
   }
 
-  // -------------------- Azure/WebSpeech TTS --------------------
+  /* -------------------- Azure/WebSpeech TTS -------------------- */
   async function getAzureToken() {
     const cache = azureRef.current;
     if (cache.token && cache.exp > now() + 10_000) return cache;
@@ -417,7 +389,7 @@ export default function EmbedPage() {
 
     try {
       if (soundOn) {
-        // Always Azure voice for audible speech (consistent voice)
+        // Always Azure for audible speech; fallback to WebSpeech if Azure fails.
         try { await playAzureTTS(text); }
         catch { await playWebSpeech(text); }
       } else {
@@ -430,7 +402,7 @@ export default function EmbedPage() {
     }
   }
 
-  // -------------------- Chat flow --------------------
+  /* -------------------- Chat flow -------------------- */
   async function sendToAgent(text) {
     if (!text) return '';
     try {
@@ -493,7 +465,7 @@ export default function EmbedPage() {
     bumpActivity();
   }
 
-  // -------------------- Waveform UI --------------------
+  /* -------------------- Waveform UI -------------------- */
   const barsRef = useRef(null);
   useEffect(() => {
     let raf = 0;
@@ -531,9 +503,11 @@ export default function EmbedPage() {
     return () => cancelAnimationFrame(raf);
   }, [speaking]);
 
-  // -------------------- Teardown --------------------
+  /* -------------------- Teardown -------------------- */
   function teardown() {
-    sessionRef.current++; // invalidate pending audio
+    sessionRef.current++; // cancel pending audio
+    try { clearTimeout(kickoffTimerRef.current || 0); } catch {}
+    kickoffTimerRef.current = 0;
 
     try { recognizerRef.current?.stop(); } catch {}
     recognizerRef.current = null;
@@ -574,8 +548,8 @@ export default function EmbedPage() {
     return () => { try { delete window.widgetStop; } catch {} };
   }, []);
 
-  // ---------- Kickoff helpers ----------
-  async function waitForChatId(maxMs = 6000) { // increased from 2000
+  /* ---------- Kickoff helpers ---------- */
+  async function waitForChatId(maxMs = 6000) {
     const start = now();
     while (!chatId && now() - start < maxMs) {
       await new Promise(r => setTimeout(r, 50));
@@ -585,20 +559,20 @@ export default function EmbedPage() {
 
   async function kickoffAssistantFirst(seqToken) {
     const ok = await waitForChatId(6000);
-    if (!ok) return;
+    if (!ok || seqToken !== kickoffSeqRef.current) return;
 
-    // Autoplay unlocks
+    // Unlock everything so Azure TTS won't be blocked
     ensureAudioContextArmed();
     primeAutoplayUnlock();
-    await silentWebSpeechUnlock(); // silent, keeps Azure as the audible voice
+    await silentWebSpeechUnlock(); // silent unlock, voice stays Azure
 
     const reply = await sendToAgent('Hello');
-    if (seqToken !== kickoffSeqRef.current) return; // newer open happened
+    if (seqToken !== kickoffSeqRef.current) return; // cancelled/reopened
     setMessages((m) => [...m, { role: 'assistant', content: reply }]);
-    await speakText(reply); // Azure voice
+    await speakText(reply);
   }
 
-  // -------------------- Host messages: close/open --------------------
+  /* -------------------- Host messages: close/open -------------------- */
   useEffect(() => {
     function onMessage(evt) {
       try {
@@ -608,33 +582,33 @@ export default function EmbedPage() {
         if (data.type === 'avatar-widget:close') {
           teardown();
         } else if (data.type === 'avatar-widget:open' || data.type === 'avatar-widget:kickoff') {
-          // Prepare audio + mic
+          // Prepare audio/mic and schedule kickoff ~1s
           try { window.speechSynthesis?.cancel(); } catch {}
           setSoundOn(true);
           wantListeningRef.current = true;
           setMicOn(true);
           setStatus('Listening');
 
-          ensureAudioContextArmed();
-          primeAutoplayUnlock();
-
           ensureMicPermission().finally(() => {
             startRecognition(false);
           });
 
-          // Speak-first kickoff (exactly once per open)
+          // Only once per open; cancel any previous pending kickoff
+          try { clearTimeout(kickoffTimerRef.current || 0); } catch {}
           kickoffSeqRef.current += 1;
           const token = kickoffSeqRef.current;
-          setTimeout(() => { kickoffAssistantFirst(token); }, 300);
+          kickoffTimerRef.current = window.setTimeout(() => {
+            kickoffAssistantFirst(token);
+          }, 250); // ~1s total after audio/token unlock
         }
       } catch {}
     }
     window.addEventListener('message', onMessage);
     return () => window.removeEventListener('message', onMessage);
   }, [chatId]);
-  // ------------------------------------
+  /* ------------------------------------ */
 
-  // -------------------- UI --------------------
+  /* -------------------- UI -------------------- */
   return (
     <div className="wrap">
       <style>{styles}</style>
@@ -645,17 +619,17 @@ export default function EmbedPage() {
             {micOn ? (speaking ? 'Speaking' : (status || 'Listening')) : (status || 'Turn Mic On to Speak')}
           </div>
 
-          <div className="controls">
-            <button className={cls('btn', micOn ? '' : 'btnOff')} onClick={toggleMic} title={micOn ? 'Turn microphone off' : 'Turn microphone on'} aria-label="Toggle microphone">
-              <span className="i">🎙️</span><span>{micOn ? 'Mic On' : 'Mic Off'}</span>
-            </button>
-            <button className={cls('btn', soundOn ? '' : 'btnOff')} onClick={toggleSound} title={soundOn ? 'Mute assistant' : 'Unmute assistant'} aria-label="Toggle sound">
-              <span className="i">🔊</span><span>{soundOn ? 'Sound On' : 'Sound Off'}</span>
-            </button>
-            <button className="btn" onClick={handleRestart} title="Restart conversation" aria-label="Restart conversation">
-              <span className="i">🔄</span><span>Restart</span>
-            </button>
-          </div>
+        <div className="controls">
+          <button className={cls('btn', micOn ? '' : 'btnOff')} onClick={toggleMic} title={micOn ? 'Turn microphone off' : 'Turn microphone on'} aria-label="Toggle microphone">
+            <span className="i">🎙️</span><span>{micOn ? 'Mic On' : 'Mic Off'}</span>
+          </button>
+          <button className={cls('btn', soundOn ? '' : 'btnOff')} onClick={toggleSound} title={soundOn ? 'Mute assistant' : 'Unmute assistant'} aria-label="Toggle sound">
+            <span className="i">🔊</span><span>{soundOn ? 'Sound On' : 'Sound Off'}</span>
+          </button>
+          <button className="btn" onClick={handleRestart} title="Restart conversation" aria-label="Restart conversation">
+            <span className="i">🔄</span><span>Restart</span>
+          </button>
+        </div>
         </div>
 
         <div className="bars" ref={barsRef} aria-hidden>
@@ -684,7 +658,6 @@ export default function EmbedPage() {
 }
 
 const styles = `
-/* unchanged styles */
 .wrap{display:flex;flex-direction:column;width:100%;height:100%;background:#0B0F19;color:#E6E8EE;font-family:ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial}
 .top{flex:0 0 45%;min-height:180px;padding:14px 14px 8px;display:flex;flex-direction:column}
 .statusRow{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:10px}
