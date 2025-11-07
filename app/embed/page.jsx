@@ -145,11 +145,12 @@ export default function EmbedPage() {
 
   // -------------------- Mount/init --------------------
   useEffect(() => {
-    let auto = true;
+    let auto = false;
     let greetTimer = 0;
     try {
       const u = new URL(window.location.href);
-      auto = (u.searchParams.get('autostart') ?? '1') !== '0';
+      const autostartParam = (u.searchParams.get('autostart') || '').toLowerCase();
+      auto = autostartParam === '1' || autostartParam === 'true' || autostartParam === 'yes';
     } catch {}
 
     if (!auto) {
