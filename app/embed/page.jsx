@@ -73,9 +73,6 @@ export default function EmbedPage() {
   const interruptableAtRef = useRef(0);
   const hasSpokenOnceRef = useRef(false);
 
-  // FIX: explicit open-state gate — TTS won’t run unless this is true
-  const openedRef = useRef(false);
-
   const lastActivityRef = useRef(now());
   const idleTimerRef = useRef(0);
 
@@ -84,12 +81,16 @@ export default function EmbedPage() {
   // Guarantees no stale TTS fires after close
   const sessionRef = useRef(0);
 
+  // NEW: gate speech until widget is explicitly opened
+  const openedRef = useRef(false);
+
   // Voice: prefer server-private env, then public env, else Kim fallback
   const VOICE = useMemo(() => {
     const v =
       process.env.AZURE_TTS_VOICE ||
       process.env.NEXT_PUBLIC_AZURE_TTS_VOICE ||
       'en-AU-KimNeural';
+    // Debug so you can verify at runtime
     try { console.info('[Widget] Using Azure voice:', v); } catch {}
     return v;
   }, []);
@@ -123,6 +124,7 @@ export default function EmbedPage() {
       try { audioCtxRef.current.resume(); } catch {}
     }
 
+    // One-time unlock listeners (if user interacts inside the iframe later)
     const unlock = () => {
       if (!audioCtxRef.current) create();
       else try { audioCtxRef.current.resume(); } catch {}
@@ -160,9 +162,6 @@ export default function EmbedPage() {
       wantListeningRef.current = false;
       setMicOn(false);
       setStatus('Turn Mic On to Speak');
-      openedRef.current = false; // FIX: ensure closed by default
-    } else {
-      openedRef.current = true;   // FIX: allow auto start only when explicitly requested
     }
 
     (async () => {
@@ -334,6 +333,7 @@ export default function EmbedPage() {
 
   function buildSSML(text) {
     const esc = (s) => s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+    // Note: voice name (Kim) controls accent; xml:lang is non-critical here
     return `<?xml version="1.0"?>
 <speak version="1.0" xml:lang="en-US">
   <voice name="${VOICE}">
@@ -396,7 +396,7 @@ export default function EmbedPage() {
         'Content-Type': 'application/ssml+xml',
         'X-Microsoft-OutputFormat': 'audio-24khz-48kbitrate-mono-mp3'
       },
-      body: buildSSML(text)
+        body: buildSSML(text)
     });
     if (!r.ok) throw new Error('azure tts failed');
     if (mySession !== sessionRef.current) throw new Error('cancelled');
@@ -451,10 +451,10 @@ export default function EmbedPage() {
   }
 
   async function speakText(text) {
-    // FIX: Do not speak unless widget is OPEN and sound is ON
-    if (!openedRef.current || !soundOnRef.current) return;
-    if (!text) return;
+    // NEW: do not speak unless the widget has been explicitly opened
+    if (!openedRef.current) return;
 
+    if (!text) return;
     const mySession = sessionRef.current;
     lastSpokenRef.current = text;
     let abortedByUser = false;
@@ -506,7 +506,9 @@ export default function EmbedPage() {
         await Promise.race([new Promise((r) => setTimeout(r, 220)), abortPromise]);
       }
     } catch (err) {
-      // swallow non-abort errors
+      if (err?.message !== 'aborted') {
+        // swallow other playback failures
+      }
     } finally {
       abortSpeakRef.current = null;
       finish();
@@ -525,8 +527,9 @@ export default function EmbedPage() {
   }
 
   function speakLatestAssistant(forceRepeat = false) {
-    // FIX: respect open gate
+    // NEW: respect open gate
     if (!openedRef.current) return;
+
     const text = latestAssistantContent();
     if (!text) return;
     if (!forceRepeat && text === lastSpokenRef.current) return;
@@ -744,7 +747,7 @@ export default function EmbedPage() {
     setSoundOn(false);
     setStatus('Turn Mic On to Speak');
 
-    // FIX: mark as closed so nothing speaks until explicit open
+    // NEW: mark closed so no speech can fire post-teardown
     openedRef.current = false;
   }
 
@@ -762,9 +765,9 @@ export default function EmbedPage() {
 
         if (data.type === 'avatar-widget:close') {
           teardown();
-          openedRef.current = false; // FIX
+          openedRef.current = false; // NEW
         } else if (data.type === 'avatar-widget:open') {
-          openedRef.current = true;  // FIX: allow speaking only after open
+          openedRef.current = true;  // NEW
 
           // Fresh reopen: resume conversation with the last assistant turn
           try { window.speechSynthesis?.cancel(); } catch {}
