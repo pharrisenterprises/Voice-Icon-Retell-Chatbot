@@ -259,14 +259,20 @@ export default function EmbedPage() {
 
     R.onresult = (e) => {
       let t = '';
+      let maxConfidence = 0;
       for (let i = e.resultIndex; i < e.results.length; i++) {
         const res = e.results[i];
-        if (res.isFinal) t += (res[0]?.transcript || '');
+        if (res.isFinal) {
+          const chunk = res[0]?.transcript || '';
+          if (chunk) t += chunk;
+          const conf = typeof res[0]?.confidence === 'number' ? res[0].confidence : 0;
+          if (conf > maxConfidence) maxConfidence = conf;
+        }
       }
       t = (t || '').trim();
       if (!t) return;
       if (speakingRef.current) {
-        if (looksLikeAssistantEcho(t)) {
+        if (looksLikeAssistantEcho(t, maxConfidence)) {
           return;
         }
         interruptAssistant('asr_result');
@@ -518,19 +524,57 @@ export default function EmbedPage() {
       .trim();
   }
 
-  function looksLikeAssistantEcho(candidate) {
+  function lcsSimilarity(a, b) {
+    if (!a || !b) return 0;
+    const maxLen = 160;
+    const s1 = a.slice(0, maxLen);
+    const s2 = b.slice(0, maxLen);
+    const dp = Array(s1.length + 1).fill(null).map(() => Array(s2.length + 1).fill(0));
+    for (let i = 1; i <= s1.length; i++) {
+      for (let j = 1; j <= s2.length; j++) {
+        if (s1[i - 1] === s2[j - 1]) dp[i][j] = dp[i - 1][j - 1] + 1;
+        else dp[i][j] = Math.max(dp[i - 1][j], dp[i][j - 1]);
+      }
+    }
+    const lcs = dp[s1.length][s2.length];
+    return lcs / Math.min(s1.length, s2.length);
+  }
+
+  function looksLikeAssistantEcho(candidate, confidence = 1) {
     const cand = normalizeTranscript(candidate);
     const last = normalizeTranscript(lastSpokenRef.current || '');
     if (!cand || !last) return false;
+    if (cand.length <= 3) return true;
     if (last.includes(cand)) return true;
+
     const candWords = cand.split(' ').filter(Boolean);
     if (!candWords.length) return false;
-    const lastWords = new Set(last.split(' ').filter(Boolean));
+    const lastCounts = new Map();
+    for (const w of last.split(' ').filter(Boolean)) {
+      lastCounts.set(w, (lastCounts.get(w) || 0) + 1);
+    }
+
     let overlap = 0;
     for (const w of candWords) {
-      if (lastWords.has(w)) overlap += 1;
+      const count = lastCounts.get(w);
+      if (count) {
+        overlap += 1;
+        if (count === 1) lastCounts.delete(w);
+        else lastCounts.set(w, count - 1);
+      }
     }
-    return overlap / candWords.length >= 0.7;
+    const uniqueUserWords = candWords.length - overlap;
+    const overlapRatio = overlap / candWords.length;
+
+    if (candWords.length <= 4 && uniqueUserWords === 0) return true;
+    if (overlapRatio >= 0.8 && uniqueUserWords <= 2) return true;
+    if (confidence < 0.45 && overlapRatio >= 0.5) return true;
+
+    const charSim = lcsSimilarity(cand, last);
+    if (charSim >= 0.82 && uniqueUserWords <= 2) return true;
+    if (candWords.length <= 6 && charSim >= 0.75 && uniqueUserWords === 0) return true;
+
+    return false;
   }
 
   // -------------------- Chat flow --------------------
