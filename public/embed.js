@@ -19,6 +19,8 @@
         return window.location.origin;
       })(),
       elements: { container: null, iframe: null, header: null, closeBtn: null },
+      frameReady: false,
+      queue: [],
     };
   }
 
@@ -79,6 +81,12 @@
     var iframe = document.createElement('iframe');
     iframe.className = 'avatar-widget-iframe';
     iframe.allow = 'microphone; autoplay; clipboard-read; clipboard-write; speaker-selection';
+    iframe.addEventListener('load', function () {
+      var S = window[WNS];
+      S.frameReady = true;
+      flushQueue();
+      if (S.open) postToFrame('open', true);
+    });
 
     container.appendChild(header);
     container.appendChild(iframe);
@@ -91,12 +99,29 @@
 
   function setIframeSrc() {
     var S = window[WNS], iframe = S.elements.iframe; if (!iframe) return;
-    if (!iframe.src) iframe.src = S.origin + '/embed?layout=compact&videoFirst=1';
+    if (!iframe.src) {
+      S.frameReady = false;
+      S.queue.length = 0;
+      iframe.src = S.origin + '/embed?layout=compact&videoFirst=1';
+    }
   }
 
-  function postToFrame(type) {
+  function flushQueue() {
+    var S = window[WNS];
+    if (!S.frameReady) return;
+    while (S.queue.length) {
+      postToFrame(S.queue.shift(), true);
+    }
+  }
+
+  function postToFrame(type, bypassQueue) {
+    var S = window[WNS];
+    if (!bypassQueue && !S.frameReady) {
+      S.queue.push(type);
+      return;
+    }
     try {
-      var S = window[WNS], f = S.elements.iframe;
+      var f = S.elements.iframe;
       if (f && f.contentWindow) f.contentWindow.postMessage({ type: 'avatar-widget:' + type }, '*');
     } catch (e) {}
   }
