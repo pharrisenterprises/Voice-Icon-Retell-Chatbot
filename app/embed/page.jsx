@@ -78,6 +78,7 @@ export default function EmbedPage() {
   const abortSpeakRef = useRef(null);
   const interruptableAtRef = useRef(0);
   const hasSpokenOnceRef = useRef(false);
+  const lastSpeakFailedRef = useRef(false);
 
   const lastActivityRef = useRef(now());
   const idleTimerRef = useRef(0);
@@ -475,6 +476,7 @@ export default function EmbedPage() {
     if (!text) return;
     const mySession = sessionRef.current;
     lastSpokenRef.current = text;
+    lastSpeakFailedRef.current = false;
     let abortedByUser = false;
 
     speakingRef.current = true;
@@ -527,6 +529,7 @@ export default function EmbedPage() {
       }
     } catch (err) {
       if (err?.message !== 'aborted') {
+        lastSpeakFailedRef.current = true;
         // swallow other playback failures
       }
     } finally {
@@ -800,11 +803,26 @@ export default function EmbedPage() {
               speakLatestAssistant(true);
             }, 150);
           });
+        } else if (data.type === 'avatar-widget:gesture') {
+          ensureAudioContextArmed();
+          primeAutoplayUnlock();
+          if (lastSpeakFailedRef.current && !speakingRef.current) {
+            setTimeout(() => speakLatestAssistant(true), 60);
+          }
         }
       } catch {}
     }
     window.addEventListener('message', onMessage);
     return () => window.removeEventListener('message', onMessage);
+  }, []);
+
+  useEffect(() => {
+    try {
+      const parent = window.parent;
+      if (parent && parent !== window) {
+        parent.postMessage({ type: 'avatar-widget:ready' }, '*');
+      }
+    } catch {}
   }, []);
 
   // -------------------- UI --------------------
