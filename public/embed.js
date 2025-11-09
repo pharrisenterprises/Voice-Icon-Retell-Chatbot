@@ -21,6 +21,7 @@
       elements: { container: null, iframe: null, header: null, closeBtn: null },
       frameReady: false,
       queue: [],
+      readyListener: false,
     };
   }
 
@@ -81,12 +82,6 @@
     var iframe = document.createElement('iframe');
     iframe.className = 'avatar-widget-iframe';
     iframe.allow = 'microphone; autoplay; clipboard-read; clipboard-write; speaker-selection';
-    iframe.addEventListener('load', function () {
-      var S = window[WNS];
-      S.frameReady = true;
-      flushQueue();
-      if (S.open) postToFrame('open', true);
-    });
 
     container.appendChild(header);
     container.appendChild(iframe);
@@ -126,6 +121,23 @@
     } catch (e) {}
   }
 
+  function bindReadyListener() {
+    var S = window[WNS];
+    if (S.readyListener) return;
+    S.readyListener = true;
+    window.addEventListener('message', function (evt) {
+      try {
+        var data = evt && evt.data;
+        if (!data || typeof data !== 'object') return;
+        if (data.type !== 'avatar-widget:ready') return;
+        if (S.origin && evt.origin && evt.origin !== S.origin) return;
+        S.frameReady = true;
+        flushQueue();
+        if (S.open) postToFrame('open', true);
+      } catch (e) {}
+    });
+  }
+
   function mount(opts) {
     var S = window[WNS];
     if (S.mounted) {
@@ -137,6 +149,7 @@
     }
     S.opts = opts || {};
     buildDOM(S.opts);
+    bindReadyListener();
     S.mounted = true;
     emit('ready', { mounted: true });
   }
@@ -158,6 +171,13 @@
     emit('closed'); postToFrame('close');
   }
 
-  var API = { mount: mount, open: open, close: close };
+  function gesture() {
+    var S = window[WNS];
+    if (!S.mounted) mount({});
+    setIframeSrc();
+    postToFrame('gesture');
+  }
+
+  var API = { mount: mount, open: open, close: close, gesture: gesture };
   window.AvatarWidget = API;
 })();
