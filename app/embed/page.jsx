@@ -9,7 +9,7 @@ import React, { useEffect, useMemo, useRef, useState } from 'react';
  * - Reopen turns Mic+Sound on and the very next reply SPEAKS (WebSpeech 1st), then Azure after.
  */
 
-const INITIAL_MIC_ON = true;
+const INITIAL_MIC_ON = false;
 const INITIAL_SOUND_ON = true;
 const IDLE_TIMEOUT_MS = 60_000;
 
@@ -149,14 +149,20 @@ export default function EmbedPage() {
 
   // -------------------- Mount/init --------------------
   useEffect(() => {
-    let auto = false;
+    let wantsAuto = false;
+    let wantsManual = false;
     try {
       const u = new URL(window.location.href);
       const autostartParam = (u.searchParams.get('autostart') || '').toLowerCase();
-      auto = autostartParam === '1' || autostartParam === 'true' || autostartParam === 'yes';
+      wantsAuto = ['1', 'true', 'yes', 'auto', 'force'].includes(autostartParam);
+      wantsManual = ['0', 'false', 'no', 'off', 'manual'].includes(autostartParam);
     } catch {}
 
-    if (!auto) {
+    let inIframe = false;
+    try { inIframe = window.self !== window.top; } catch { inIframe = true; }
+    const shouldAutoBoot = wantsAuto || (!wantsManual && !inIframe);
+
+    if (!shouldAutoBoot) {
       wantListeningRef.current = false;
       setMicOn(false);
       setStatus('Turn Mic On to Speak');
@@ -194,9 +200,14 @@ export default function EmbedPage() {
     window.addEventListener('pointerdown', unlock, { once: true });
     window.addEventListener('keydown', unlock, { once: true });
 
-    if (auto) {
-      ensureMicPermission();
-      setTimeout(() => startRecognition(true), 50);
+    if (shouldAutoBoot) {
+      ensureMicPermission().finally(() => {
+        setTimeout(() => {
+          startRecognition(true);
+          bumpActivity();
+          setTimeout(() => speakLatestAssistant(true), 150);
+        }, 50);
+      });
     }
 
     // expose stop to host immediately
@@ -771,6 +782,7 @@ export default function EmbedPage() {
           ensureMicPermission().finally(() => {
             startRecognition(false);
             bumpActivity();
+            setTimeout(() => speakLatestAssistant(true), 150);
           });
         }
       } catch {}
@@ -834,7 +846,7 @@ const styles = `
 .statusRow{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:10px}
 .pill{font-size:12px;letter-spacing:.2px;padding:6px 10px;border-radius:999px;background:rgba(255,255,255,0.05);border:1px solid rgba(255,255,255,0.08)}
 .pillOn{background:rgba(22,163,74,0.15);border-color:rgba(22,163,74,0.35);color:#b9f6ca}
-.pillSpeaking{background:rgba(59,130,246,0.18);border-color:rgba(59,130,246,0.45);color:#dbeafe}
+.pillSpeaking{background:rgba(59,130,246,0.18);border-color:rgba(59,130,246,0.45);color:#dbeafe}o9l0 
 .pillOff{background:rgba(148,163,184,0.12);border-color:rgba(148,163,184,0.28);color:#e2e8f0}
 .controls{display:flex;gap:8px}
 .btn{display:inline-flex;align-items:center;gap:6px;padding:7px 10px;background:rgba(255,255,255,0.06);color:#E6E8EE;border:1px solid rgba(255,255,255,0.12);border-radius:10px;font-size:12px;cursor:pointer;transition:all .15s ease}
