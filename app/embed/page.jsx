@@ -59,6 +59,10 @@ export default function EmbedPage() {
 
   const soundOnRef = useRef(INITIAL_SOUND_ON);
   useEffect(() => { soundOnRef.current = soundOn; }, [soundOn]);
+  function setSoundInstant(next) {
+    soundOnRef.current = next;
+    setSoundOn(next);
+  }
 
   // Audio + ASR
   const audioElRef = useRef(null);
@@ -166,6 +170,8 @@ export default function EmbedPage() {
       wantListeningRef.current = false;
       setMicOn(false);
       setStatus('Turn Mic On to Speak');
+    } else {
+      setSoundInstant(true);
     }
 
     (async () => {
@@ -201,11 +207,17 @@ export default function EmbedPage() {
     window.addEventListener('keydown', unlock, { once: true });
 
     if (shouldAutoBoot) {
+      ensureAudioContextArmed();
+      primeAutoplayUnlock();
       ensureMicPermission().finally(() => {
         setTimeout(() => {
           startRecognition(true);
           bumpActivity();
-          setTimeout(() => speakLatestAssistant(true), 150);
+          setTimeout(() => {
+            ensureAudioContextArmed();
+            primeAutoplayUnlock();
+            speakLatestAssistant(true);
+          }, 150);
         }, 50);
       });
     }
@@ -749,7 +761,7 @@ export default function EmbedPage() {
 
     speakingRef.current = false;
     setSpeaking(false);
-    setSoundOn(false);
+    setSoundInstant(false);
     setStatus('Turn Mic On to Speak');
   }
 
@@ -771,7 +783,7 @@ export default function EmbedPage() {
           // Fresh reopen: resume conversation with the last assistant turn
           try { window.speechSynthesis?.cancel(); } catch {}
 
-          setSoundOn(true);
+          setSoundInstant(true);
           wantListeningRef.current = true;
           setMicOn(true);
           setStatus('Listening');
@@ -782,7 +794,11 @@ export default function EmbedPage() {
           ensureMicPermission().finally(() => {
             startRecognition(false);
             bumpActivity();
-            setTimeout(() => speakLatestAssistant(true), 150);
+            setTimeout(() => {
+              ensureAudioContextArmed();
+              primeAutoplayUnlock();
+              speakLatestAssistant(true);
+            }, 150);
           });
         }
       } catch {}
