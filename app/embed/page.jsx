@@ -81,7 +81,6 @@ export default function EmbedPage() {
   const lastSpeakFailedRef = useRef(false);
   const pendingSpeakRef = useRef(false);
   const gestureSeenRef = useRef(false);
-  const forceSpeakOnGestureRef = useRef(false);
 
   const lastActivityRef = useRef(now());
   const idleTimerRef = useRef(0);
@@ -162,9 +161,9 @@ export default function EmbedPage() {
       gestureSpeakTimerRef.current = 0;
     }
   }
-  function scheduleGestureDrivenSpeak(delay = 60, force = false) {
+  function scheduleGestureDrivenSpeak(delay = 60) {
     if (speakingRef.current) return;
-    if (!force && !pendingSpeakRef.current && !lastSpeakFailedRef.current) return;
+    if (!pendingSpeakRef.current && !lastSpeakFailedRef.current) return;
     cancelGestureSpeak();
     gestureSpeakTimerRef.current = window.setTimeout(() => {
       gestureSpeakTimerRef.current = 0;
@@ -486,7 +485,6 @@ export default function EmbedPage() {
     lastSpokenRef.current = text;
     pendingSpeakRef.current = false;
     lastSpeakFailedRef.current = false;
-    forceSpeakOnGestureRef.current = false;
     const shouldResumeRecognition = !!(wantListeningRef.current && recognizerRef.current);
     if (shouldResumeRecognition) {
       stopRecognition('suspend_for_speech');
@@ -781,7 +779,6 @@ export default function EmbedPage() {
     pendingSpeakRef.current = false;
     lastSpeakFailedRef.current = false;
     gestureSeenRef.current = false;
-    forceSpeakOnGestureRef.current = false;
   }
 
   useEffect(() => {
@@ -809,7 +806,6 @@ export default function EmbedPage() {
           pendingSpeakRef.current = true;
           lastSpeakFailedRef.current = false;
           gestureSeenRef.current = false;
-          forceSpeakOnGestureRef.current = true;
           cancelGestureSpeak();
 
           ensureAudioContextArmed();
@@ -818,16 +814,19 @@ export default function EmbedPage() {
           ensureMicPermission().finally(() => {
             startRecognition(false);
             bumpActivity();
+            setTimeout(() => {
+              ensureAudioContextArmed();
+              primeAutoplayUnlock();
+              pendingSpeakRef.current = true;
+              speakLatestAssistant(true);
+            }, 140);
           });
         } else if (data.type === 'avatar-widget:gesture') {
           ensureAudioContextArmed();
           primeAutoplayUnlock();
           gestureSeenRef.current = true;
-          const force = forceSpeakOnGestureRef.current;
-          if (force) forceSpeakOnGestureRef.current = false;
-          if (force || pendingSpeakRef.current || lastSpeakFailedRef.current) {
-            scheduleGestureDrivenSpeak(force ? 45 : 80, force);
-          }
+          pendingSpeakRef.current = true;
+          scheduleGestureDrivenSpeak(80);
         }
       } catch {}
     }
