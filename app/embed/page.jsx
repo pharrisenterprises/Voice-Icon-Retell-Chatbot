@@ -96,9 +96,6 @@ export default function EmbedPage() {
   const idleTimerRef = useRef(0);
 
   const [speaking, setSpeaking] = useState(false);
-  const [userUnlocked, setUserUnlocked] = useState(false);
-  const userUnlockedRef = useRef(false);
-  const [needsUserStart, setNeedsUserStart] = useState(false);
 
   // Guarantees no stale TTS fires after close
   const sessionRef = useRef(0);
