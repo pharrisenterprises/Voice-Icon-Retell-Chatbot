@@ -485,6 +485,10 @@ export default function EmbedPage() {
     lastSpokenRef.current = text;
     pendingSpeakRef.current = false;
     lastSpeakFailedRef.current = false;
+    const shouldResumeRecognition = !!(wantListeningRef.current && recognizerRef.current);
+    if (shouldResumeRecognition) {
+      stopRecognition('suspend_for_speech');
+    }
     let abortedByUser = false;
 
     speakingRef.current = true;
