@@ -765,10 +765,10 @@ export default function EmbedPage() {
     wantListeningRef.current = true;
     setMicOn(true);
     setStatus('Listening');
-    pendingSpeakRef.current = !immediateSpeech;
+    pendingSpeakRef.current = true;
     lastSpeakFailedRef.current = false;
     gestureSeenRef.current = false;
-    forceGestureSpeakRef.current = !immediateSpeech;
+    forceGestureSpeakRef.current = true;
     cancelGestureSpeak();
     ensureAudioContextArmed();
     primeAutoplayUnlock();
@@ -796,7 +796,7 @@ export default function EmbedPage() {
     if (!userUnlockedRef.current) {
       handleUserStart(true);
     } else {
-      resumeDockSession(true);
+      resumeDockSession(false);
     }
   }
 
@@ -906,7 +906,7 @@ export default function EmbedPage() {
         } else if (data.type === 'avatar-widget:open') {
           if (!dockOpenRef.current) setDockOpen(true);
           if (!userUnlockedRef.current) return;
-          resumeDockSession(true);
+          resumeDockSession(false);
         } else if (data.type === 'avatar-widget:gesture') {
           if (!userUnlockedRef.current) return;
           ensureAudioContextArmed();
