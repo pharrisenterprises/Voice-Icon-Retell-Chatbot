@@ -814,7 +814,6 @@ export default function EmbedPage() {
           ensureMicPermission().finally(() => {
             startRecognition(false);
             bumpActivity();
-            scheduleGestureDrivenSpeak(140);
           });
         } else if (data.type === 'avatar-widget:gesture') {
           ensureAudioContextArmed();
