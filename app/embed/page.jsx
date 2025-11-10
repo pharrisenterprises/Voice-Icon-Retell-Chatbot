@@ -1,6 +1,6 @@
 'use client';
 
-import React, { useEffect, useMemo, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
 /**
  * Voice-only widget (Retell text routes + client ASR + Azure/WebSpeech TTS).
@@ -27,8 +27,15 @@ const AZURE_STYLE = 'cheerful';
 
 const DEFAULT_GREETING = "G'day! I'm Otto \u{1F44B}  Type below or tap the mic to talk.";
 
+const DOCK_CLOSED_SIZE = { width: 84, height: 84 };
+const DOCK_OPEN_SIZE = { width: 420, height: 580 };
+
 function now() { return Date.now(); }
 function cls(...a) { return a.filter(Boolean).join(' '); }
+function detectInIframe() {
+  if (typeof window === 'undefined') return false;
+  try { return window.self !== window.top; } catch { return true; }
+}
 
 function useAutoScroll(depKey) {
   const listRef = useRef(null);
@@ -42,6 +49,36 @@ function useAutoScroll(depKey) {
 }
 
 export default function EmbedPage() {
+  const initialInIframe = detectInIframe();
+  const [launcherEnabled] = useState(initialInIframe);
+  const [dockOpen, setDockOpen] = useState(() => !initialInIframe);
+  const dockOpenRef = useRef(!initialInIframe);
+  useEffect(() => { dockOpenRef.current = dockOpen; }, [dockOpen]);
+  const inIframeRef = useRef(initialInIframe);
+  const notifyParentSize = useCallback((open) => {
+    if (!inIframeRef.current) return;
+    try {
+      const parent = window.parent;
+      if (!parent || parent === window) return;
+      const size = open ? DOCK_OPEN_SIZE : DOCK_CLOSED_SIZE;
+      let compact = false;
+      try { compact = window.matchMedia('(max-width:520px)').matches; } catch {}
+      parent.postMessage({
+        type: 'avatar-widget:size',
+        open,
+        width: size.width,
+        height: size.height,
+        compact
+      }, '*');
+    } catch {}
+  }, []);
+  useEffect(() => { notifyParentSize(dockOpen); }, [dockOpen, notifyParentSize]);
+  useEffect(() => {
+    if (!inIframeRef.current) return;
+    const handleResize = () => notifyParentSize(dockOpenRef.current);
+    window.addEventListener('resize', handleResize);
+    return () => window.removeEventListener('resize', handleResize);
+  }, [notifyParentSize]);
   // Controls
   const [micOn, setMicOn] = useState(INITIAL_MIC_ON);
   const [soundOn, setSoundOn] = useState(INITIAL_SOUND_ON);
@@ -209,8 +246,9 @@ export default function EmbedPage() {
 
     let inIframe = false;
     try { inIframe = window.self !== window.top; } catch { inIframe = true; }
-    const shouldAutoBoot = wantsAuto || (!wantsManual && !inIframe);
-    setNeedsUserStart(!shouldAutoBoot);
+    const autoAllowed = !launcherEnabled && !inIframe;
+    const shouldAutoBoot = autoAllowed && (wantsAuto || !wantsManual);
+    setNeedsUserStart(!shouldAutoBoot && !launcherEnabled);
 
     if (!shouldAutoBoot) {
       wantListeningRef.current = false;
@@ -269,7 +307,7 @@ export default function EmbedPage() {
     }
 
     // expose stop to host immediately
-    window.widgetStop = teardown;
+    window.widgetStop = () => closeDock('host');
 
     return () => {
       try { delete window.widgetStop; } catch {}
@@ -719,6 +757,49 @@ export default function EmbedPage() {
     bumpActivity();
   }
 
+  // -------------------- Dock controls --------------------
+  function resumeDockSession(immediateSpeech = false) {
+    if (!userUnlockedRef.current) return;
+    try { window.speechSynthesis?.cancel(); } catch {}
+    setSoundInstant(true);
+    wantListeningRef.current = true;
+    setMicOn(true);
+    setStatus('Listening');
+    pendingSpeakRef.current = immediateSpeech ? false : true;
+    lastSpeakFailedRef.current = false;
+    gestureSeenRef.current = false;
+    forceGestureSpeakRef.current = immediateSpeech ? false : true;
+    cancelGestureSpeak();
+    ensureAudioContextArmed();
+    primeAutoplayUnlock();
+    ensureMicPermission().finally(() => {
+      startRecognition(false);
+      bumpActivity();
+      if (immediateSpeech) {
+        setTimeout(() => speakLatestAssistant(true), 60);
+      }
+    });
+  }
+
+  function closeDock(_source = 'user') {
+    if (!dockOpenRef.current) {
+      teardown();
+      return;
+    }
+    setDockOpen(false);
+    teardown();
+  }
+
+  function handleLauncherClick() {
+    bumpActivity();
+    if (!dockOpenRef.current) setDockOpen(true);
+    if (!userUnlockedRef.current) {
+      handleUserStart(true);
+    } else {
+      resumeDockSession(true);
+    }
+  }
+
   // -------------------- Waveform UI --------------------
   const barsRef = useRef(null);
   useEffect(() => {
@@ -809,7 +890,7 @@ export default function EmbedPage() {
   }
 
   useEffect(() => {
-    window.widgetStop = teardown;
+    window.widgetStop = () => closeDock('host');
     return () => { try { delete window.widgetStop; } catch {} };
   }, []);
 
@@ -821,29 +902,11 @@ export default function EmbedPage() {
         if (!data || typeof data !== 'object') return;
 
         if (data.type === 'avatar-widget:close') {
-          teardown();
+          closeDock('host');
         } else if (data.type === 'avatar-widget:open') {
+          if (!dockOpenRef.current) setDockOpen(true);
           if (!userUnlockedRef.current) return;
-          // Fresh reopen: resume conversation with the last assistant turn
-          try { window.speechSynthesis?.cancel(); } catch {}
-
-          setSoundInstant(true);
-          wantListeningRef.current = true;
-          setMicOn(true);
-          setStatus('Listening');
-          pendingSpeakRef.current = true;
-          lastSpeakFailedRef.current = false;
-          gestureSeenRef.current = false;
-          forceGestureSpeakRef.current = true;
-          cancelGestureSpeak();
-
-          ensureAudioContextArmed();
-          primeAutoplayUnlock();
-
-          ensureMicPermission().finally(() => {
-            startRecognition(false);
-            bumpActivity();
-          });
+          resumeDockSession(false);
         } else if (data.type === 'avatar-widget:gesture') {
           if (!userUnlockedRef.current) return;
           ensureAudioContextArmed();
@@ -862,6 +925,18 @@ export default function EmbedPage() {
   }, []);
 
   useEffect(() => {
+    if (!launcherEnabled) return;
+    const onKey = (e) => {
+      if (e.key === 'Escape' && dockOpenRef.current) {
+        e.preventDefault();
+        closeDock('user');
+      }
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [launcherEnabled]);
+
+  useEffect(() => {
     try {
       const parent = window.parent;
       if (parent && parent !== window) {
@@ -872,10 +947,44 @@ export default function EmbedPage() {
 
   // -------------------- UI --------------------
   return (
-    <div className="wrap">
+    <div className={cls('dockShell', launcherEnabled ? 'hasLauncher' : '')}>
       <style>{styles}</style>
 
-      <div className="top">
+      {launcherEnabled && (
+        <button
+          className={cls('launcherBtn', dockOpen ? 'launcherHidden' : '')}
+          onClick={handleLauncherClick}
+          aria-label="Open Otto assistant"
+          title="Chat with Otto"
+          aria-expanded={dockOpen}
+          type="button"
+        >
+          <span className="launcherIcon">{'\u{1F916}'}</span>
+          <span className="launcherText">Otto</span>
+        </button>
+      )}
+
+      <div
+        className={cls(
+          'wrap',
+          launcherEnabled ? 'wrapDocked' : '',
+          launcherEnabled && !dockOpen ? 'wrapDockedHidden' : ''
+        )}
+        aria-hidden={launcherEnabled && !dockOpen}
+      >
+        {launcherEnabled && (
+          <button
+            className="dockCloseBtn"
+            onClick={() => closeDock('user')}
+            aria-label="Close Otto assistant"
+            title="Close"
+            type="button"
+          >
+            {'\u2715'}
+          </button>
+        )}
+
+        <div className="top">
         <div className="statusRow">
           <div className={cls('pill', micOn ? (speaking ? 'pillSpeaking' : 'pillOn') : 'pillOff')}>
             {micOn ? (speaking ? 'Speaking' : (status || 'Listening')) : (status || 'Turn Mic On to Speak')}
@@ -915,25 +1024,37 @@ export default function EmbedPage() {
           <button className="send" aria-label="Send message" title="Send">{'\u27A4'}</button>
         </form>
       </div>
-      {needsUserStart && !userUnlocked && (
-        <div className="unlockOverlay">
-          <div className="unlockBox">
-            <p>Tap below to start the conversation and enable audio.</p>
-            <button className="unlockBtn" onClick={() => handleUserStart(true)}>Start Talking</button>
+        {needsUserStart && !userUnlocked && (
+          <div className="unlockOverlay">
+            <div className="unlockBox">
+              <p>Tap below to start the conversation and enable audio.</p>
+              <button className="unlockBtn" type="button" onClick={() => handleUserStart(true)}>Start Talking</button>
+            </div>
           </div>
-        </div>
-      )}
+        )}
+      </div>
     </div>
   );
 }
 
 const styles = `
+.dockShell{position:relative;width:100%;height:100%}
+.hasLauncher{background:transparent}
 .wrap{display:flex;flex-direction:column;width:100%;height:100%;background:#0B0F19;color:#E6E8EE;font-family:ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial}
+.wrapDocked{border-radius:18px;overflow:hidden;box-shadow:0 25px 60px rgba(0,0,0,0.55);border:1px solid rgba(255,255,255,0.08);transition:opacity .2s ease,transform .2s ease}
+.wrapDockedHidden{opacity:0;pointer-events:none;transform:scale(.94)}
+.launcherBtn{position:absolute;right:0;bottom:0;width:84px;height:84px;border-radius:999px;border:0;background:linear-gradient(135deg,#7cc6ff,#6366f1);color:#fff;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:4px;font-weight:600;cursor:pointer;box-shadow:0 15px 45px rgba(4,9,20,0.55);transition:transform .2s ease,opacity .2s ease}
+.launcherBtn:hover{transform:translateY(-2px);filter:brightness(1.05)}
+.launcherHidden{opacity:0;pointer-events:none;transform:scale(.9)}
+.launcherIcon{font-size:22px;line-height:1}
+.launcherText{font-size:13px;letter-spacing:.3px}
+.dockCloseBtn{position:absolute;top:10px;right:10px;width:32px;height:32px;border-radius:10px;border:1px solid rgba(255,255,255,0.18);background:rgba(9,11,19,0.65);color:#E6E8EE;font-size:14px;cursor:pointer;display:inline-flex;align-items:center;justify-content:center;transition:background .15s ease}
+.dockCloseBtn:hover{background:rgba(15,23,42,0.9)}
 .top{flex:0 0 45%;min-height:180px;padding:14px 14px 8px;display:flex;flex-direction:column}
 .statusRow{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:10px}
 .pill{font-size:12px;letter-spacing:.2px;padding:6px 10px;border-radius:999px;background:rgba(255,255,255,0.05);border:1px solid rgba(255,255,255,0.08)}
 .pillOn{background:rgba(22,163,74,0.15);border-color:rgba(22,163,74,0.35);color:#b9f6ca}
-.pillSpeaking{background:rgba(59,130,246,0.18);border-color:rgba(59,130,246,0.45);color:#dbeafe}o9l0 
+.pillSpeaking{background:rgba(59,130,246,0.18);border-color:rgba(59,130,246,0.45);color:#dbeafe}
 .pillOff{background:rgba(148,163,184,0.12);border-color:rgba(148,163,184,0.28);color:#e2e8f0}
 .controls{display:flex;gap:8px}
 .btn{display:inline-flex;align-items:center;gap:6px;padding:7px 10px;background:rgba(255,255,255,0.06);color:#E6E8EE;border:1px solid rgba(255,255,255,0.12);border-radius:10px;font-size:12px;cursor:pointer;transition:all .15s ease}
