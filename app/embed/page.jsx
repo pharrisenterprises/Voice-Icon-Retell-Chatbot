@@ -765,10 +765,10 @@ export default function EmbedPage() {
     wantListeningRef.current = true;
     setMicOn(true);
     setStatus('Listening');
-    pendingSpeakRef.current = immediateSpeech ? false : true;
+    pendingSpeakRef.current = !immediateSpeech;
     lastSpeakFailedRef.current = false;
     gestureSeenRef.current = false;
-    forceGestureSpeakRef.current = immediateSpeech ? false : true;
+    forceGestureSpeakRef.current = !immediateSpeech;
     cancelGestureSpeak();
     ensureAudioContextArmed();
     primeAutoplayUnlock();
@@ -906,7 +906,7 @@ export default function EmbedPage() {
         } else if (data.type === 'avatar-widget:open') {
           if (!dockOpenRef.current) setDockOpen(true);
           if (!userUnlockedRef.current) return;
-          resumeDockSession(false);
+          resumeDockSession(true);
         } else if (data.type === 'avatar-widget:gesture') {
           if (!userUnlockedRef.current) return;
           ensureAudioContextArmed();
