@@ -25,7 +25,7 @@ const AZURE_RATE = 'medium';
 const AZURE_PITCH = '+8%';
 const AZURE_STYLE = 'cheerful';
 
-const DEFAULT_GREETING = "G'day! welcome to the infinitsales chatbot, where conversation meets automation!";
+const DEFAULT_GREETING = "G'day! Welcome to the infinity Sales Chatbot, where conversation meets automation!";
 
 function now() { return Date.now(); }
 function cls(...a) { return a.filter(Boolean).join(' '); }
