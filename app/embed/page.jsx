@@ -87,6 +87,9 @@ export default function EmbedPage() {
   const idleTimerRef = useRef(0);
 
   const [speaking, setSpeaking] = useState(false);
+  const [userUnlocked, setUserUnlocked] = useState(false);
+  const userUnlockedRef = useRef(false);
+  const [needsUserStart, setNeedsUserStart] = useState(false);
 
   // Guarantees no stale TTS fires after close
   const sessionRef = useRef(0);
@@ -173,6 +176,26 @@ export default function EmbedPage() {
     }, delay);
   }
 
+  function handleUserStart(forceSpeak = true) {
+    if (userUnlockedRef.current) return;
+    userUnlockedRef.current = true;
+    setUserUnlocked(true);
+    setSoundInstant(true);
+    wantListeningRef.current = true;
+    setMicOn(true);
+    setStatus('Listening');
+    ensureAudioContextArmed();
+    primeAutoplayUnlock();
+    ensureMicPermission().finally(() => {
+      startRecognition(true);
+      bumpActivity();
+      if (forceSpeak) {
+        pendingSpeakRef.current = true;
+        speakLatestAssistant(true);
+      }
+    });
+  }
+
   // -------------------- Mount/init --------------------
   useEffect(() => {
     let wantsAuto = false;
@@ -187,6 +210,7 @@ export default function EmbedPage() {
     let inIframe = false;
     try { inIframe = window.self !== window.top; } catch { inIframe = true; }
     const shouldAutoBoot = wantsAuto || (!wantsManual && !inIframe);
+    setNeedsUserStart(!shouldAutoBoot);
 
     if (!shouldAutoBoot) {
       wantListeningRef.current = false;
@@ -799,6 +823,7 @@ export default function EmbedPage() {
         if (data.type === 'avatar-widget:close') {
           teardown();
         } else if (data.type === 'avatar-widget:open') {
+          if (!userUnlockedRef.current) return;
           // Fresh reopen: resume conversation with the last assistant turn
           try { window.speechSynthesis?.cancel(); } catch {}
 
@@ -820,6 +845,7 @@ export default function EmbedPage() {
             bumpActivity();
           });
         } else if (data.type === 'avatar-widget:gesture') {
+          if (!userUnlockedRef.current) return;
           ensureAudioContextArmed();
           primeAutoplayUnlock();
           gestureSeenRef.current = true;
@@ -889,6 +915,14 @@ export default function EmbedPage() {
           <button className="send" aria-label="Send message" title="Send">{'\u27A4'}</button>
         </form>
       </div>
+      {needsUserStart && !userUnlocked && (
+        <div className="unlockOverlay">
+          <div className="unlockBox">
+            <p>Tap below to start the conversation and enable audio.</p>
+            <button className="unlockBtn" onClick={() => handleUserStart(true)}>Start Talking</button>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
@@ -919,5 +953,9 @@ const styles = `
 .inp{flex:1;padding:10px 12px;background:rgba(255,255,255,0.06);border:1px solid rgba(255,255,255,0.12);border-radius:12px;color:#E6E8EE;outline:none;font-size:14px}
 .inp::placeholder{color:#9aa7bd}
 .send{flex:0 0 auto;width:38px;height:38px;border-radius:12px;border:1px solid rgba(255,255,255,0.15);background:linear-gradient(180deg,#7cc6ff,#3b82f6);color:white;font-size:16px;cursor:pointer}
+.unlockOverlay{position:fixed;inset:0;background:rgba(11,15,25,0.85);display:flex;align-items:center;justify-content:center;padding:20px;z-index:25}
+.unlockBox{max-width:320px;width:100%;text-align:center;background:rgba(3,7,18,0.92);border:1px solid rgba(255,255,255,0.08);border-radius:18px;padding:26px;display:flex;flex-direction:column;gap:14px;color:#E6E8EE;box-shadow:0 25px 60px rgba(0,0,0,0.55)}
+.unlockBtn{appearance:none;border:0;border-radius:999px;padding:12px 18px;font-weight:600;background:linear-gradient(180deg,#8b5cf6,#4f46e5);color:#fff;cursor:pointer;transition:filter .15s ease}
+.unlockBtn:hover{filter:brightness(1.08)}
 @media (max-width:520px){.top{flex-basis:40%}.bars span{width:calc((100% - 31*4px)/32)}}
 `;
