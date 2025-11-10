@@ -79,6 +79,8 @@ export default function EmbedPage() {
   const interruptableAtRef = useRef(0);
   const hasSpokenOnceRef = useRef(false);
   const lastSpeakFailedRef = useRef(false);
+  const pendingSpeakRef = useRef(false);
+  const gestureSeenRef = useRef(false);
 
   const lastActivityRef = useRef(now());
   const idleTimerRef = useRef(0);
@@ -150,6 +152,24 @@ export default function EmbedPage() {
       src.start(0);
       src.stop(0.01);
     } catch {}
+  }
+
+  const gestureSpeakTimerRef = useRef(0);
+  function cancelGestureSpeak() {
+    if (gestureSpeakTimerRef.current) {
+      clearTimeout(gestureSpeakTimerRef.current);
+      gestureSpeakTimerRef.current = 0;
+    }
+  }
+  function scheduleGestureDrivenSpeak(delay = 60) {
+    if (speakingRef.current) return;
+    if (!pendingSpeakRef.current && !lastSpeakFailedRef.current) return;
+    cancelGestureSpeak();
+    gestureSpeakTimerRef.current = window.setTimeout(() => {
+      gestureSpeakTimerRef.current = 0;
+      if (speakingRef.current) return;
+      speakLatestAssistant(true);
+    }, delay);
   }
 
   // -------------------- Mount/init --------------------
@@ -459,23 +479,11 @@ export default function EmbedPage() {
     });
   }
 
-  function playWebSpeech(text) {
-    return new Promise((resolve) => {
-      if (!('speechSynthesis' in window)) return resolve();
-      const u = new SpeechSynthesisUtterance(text);
-      u.rate = 1.15;
-      u.pitch = 1.08;
-      u.onend = resolve;
-      u.onerror = resolve;
-      try { window.speechSynthesis.cancel(); } catch {}
-      try { window.speechSynthesis.speak(u); } catch {}
-    });
-  }
-
   async function speakText(text) {
     if (!text) return;
     const mySession = sessionRef.current;
     lastSpokenRef.current = text;
+    pendingSpeakRef.current = false;
     lastSpeakFailedRef.current = false;
     let abortedByUser = false;
 
@@ -518,18 +526,15 @@ export default function EmbedPage() {
 
     try {
       if (soundOnRef.current) {
-        try {
-          await Promise.race([playAzureTTS(text), abortPromise]);
-        } catch (err) {
-          if (err?.message === 'aborted') throw err;
-          await Promise.race([playWebSpeech(text), abortPromise]);
-        }
+        await Promise.race([playAzureTTS(text), abortPromise]);
       } else {
         await Promise.race([new Promise((r) => setTimeout(r, 220)), abortPromise]);
       }
     } catch (err) {
       if (err?.message !== 'aborted') {
         lastSpeakFailedRef.current = true;
+        pendingSpeakRef.current = true;
+        if (gestureSeenRef.current) scheduleGestureDrivenSpeak(140);
         // swallow other playback failures
       }
     } finally {
@@ -766,6 +771,10 @@ export default function EmbedPage() {
     setSpeaking(false);
     setSoundInstant(false);
     setStatus('Turn Mic On to Speak');
+    cancelGestureSpeak();
+    pendingSpeakRef.current = false;
+    lastSpeakFailedRef.current = false;
+    gestureSeenRef.current = false;
   }
 
   useEffect(() => {
@@ -790,6 +799,9 @@ export default function EmbedPage() {
           wantListeningRef.current = true;
           setMicOn(true);
           setStatus('Listening');
+          pendingSpeakRef.current = true;
+          gestureSeenRef.current = false;
+          cancelGestureSpeak();
 
           ensureAudioContextArmed();
           primeAutoplayUnlock();
@@ -797,18 +809,12 @@ export default function EmbedPage() {
           ensureMicPermission().finally(() => {
             startRecognition(false);
             bumpActivity();
-            setTimeout(() => {
-              ensureAudioContextArmed();
-              primeAutoplayUnlock();
-              speakLatestAssistant(true);
-            }, 150);
           });
         } else if (data.type === 'avatar-widget:gesture') {
           ensureAudioContextArmed();
           primeAutoplayUnlock();
-          if (lastSpeakFailedRef.current && !speakingRef.current) {
-            setTimeout(() => speakLatestAssistant(true), 60);
-          }
+          gestureSeenRef.current = true;
+          scheduleGestureDrivenSpeak(80);
         }
       } catch {}
     }
