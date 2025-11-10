@@ -800,6 +800,7 @@ export default function EmbedPage() {
           setMicOn(true);
           setStatus('Listening');
           pendingSpeakRef.current = true;
+          lastSpeakFailedRef.current = false;
           gestureSeenRef.current = false;
           cancelGestureSpeak();
 
@@ -809,12 +810,14 @@ export default function EmbedPage() {
           ensureMicPermission().finally(() => {
             startRecognition(false);
             bumpActivity();
+            scheduleGestureDrivenSpeak(140);
           });
         } else if (data.type === 'avatar-widget:gesture') {
           ensureAudioContextArmed();
           primeAutoplayUnlock();
           gestureSeenRef.current = true;
-          scheduleGestureDrivenSpeak(80);
+          pendingSpeakRef.current = true;
+          scheduleGestureDrivenSpeak(60);
         }
       } catch {}
     }
