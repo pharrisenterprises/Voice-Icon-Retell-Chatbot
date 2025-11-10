@@ -1,11 +1,13 @@
 /* public/embed.js
- * Voice-only widget loader, dock mode, idempotent.
- * Exposes: window.AvatarWidget = { mount, open, close }
+ * Voice-only widget loader with in-iframe launcher.
+ * Exposes: window.AvatarWidget = { mount, open, close, gesture }
  * Emits window events: avatar-widget:ready|opened|closed
- * Posts messages into the iframe: {type:'avatar-widget:open'|'avatar-widget:close'}
  */
 (function () {
   var WNS = '__AvatarWidgetState__';
+  var CLOSED_SIZE = { width: 84, height: 84 };
+  var OPEN_SIZE = { width: 420, height: 580 };
+
   if (!window[WNS]) {
     window[WNS] = {
       mounted: false,
@@ -14,14 +16,20 @@
       origin: (function () {
         try {
           var s = document.currentScript;
-          if (s && s.src) { var a = document.createElement('a'); a.href = s.src; return a.protocol + '//' + a.host; }
+          if (s && s.src) {
+            var a = document.createElement('a');
+            a.href = s.src;
+            return a.protocol + '//' + a.host;
+          }
         } catch (e) {}
         return window.location.origin;
       })(),
-      elements: { container: null, iframe: null, header: null, closeBtn: null },
+      elements: { container: null, iframe: null },
       frameReady: false,
       queue: [],
       readyListener: false,
+      resizeListener: null,
+      lastSize: { width: CLOSED_SIZE.width, height: CLOSED_SIZE.height, open: false, compact: false },
     };
   }
 
@@ -34,17 +42,54 @@
     var style = document.createElement('style');
     style.id = 'avatar-widget-styles';
     style.textContent = `
-      .avatar-widget-container{position:fixed;z-index:2147483000;font-family:ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial}
+      .avatar-widget-container{position:fixed;right:20px;bottom:24px;width:${CLOSED_SIZE.width}px;height:${CLOSED_SIZE.height}px;z-index:2147483000;display:flex;align-items:stretch;justify-content:stretch;transition:width .25s ease,height .25s ease}
       .avatar-widget-hidden{display:none!important}
-      .avatar-widget-dock{right:20px;bottom:88px;width:420px;max-width:calc(100vw - 20px);height:560px;max-height:calc(100vh - 20px);border-radius:12px;overflow:hidden;box-shadow:0 20px 60px rgba(0,0,0,.35);background:#0b0f19;display:flex;flex-direction:column;border:1px solid rgba(255,255,255,.08)}
-      .avatar-widget-header{flex:0 0 40px;display:flex;align-items:center;justify-content:space-between;padding:0 10px;background:linear-gradient(180deg,rgba(255,255,255,.06),rgba(255,255,255,.02));color:#e6e8ee;font-size:13px;border-bottom:1px solid rgba(255,255,255,.08)}
-      .avatar-widget-header .title{opacity:.9}
-      .avatar-widget-close{appearance:none;border:0;background:transparent;color:#cfd3dc;width:28px;height:28px;border-radius:6px;cursor:pointer;display:inline-flex;align-items:center;justify-content:center}
-      .avatar-widget-close:hover{background:rgba(255,255,255,.08);color:#fff}
-      .avatar-widget-iframe{border:0;width:100%;height:calc(100% - 40px);background:#0b0f19}
-      @media (max-width:480px){.avatar-widget-dock{right:10px!important;bottom:10px!important;width:calc(100vw - 20px)!important;height:min(70vh,560px)!important}}
+      .avatar-widget-container.avatar-widget-compact{right:12px;bottom:16px}
+      .avatar-widget-iframe{border:0;width:100%;height:100%;background:transparent}
     `;
     document.head.appendChild(style);
+  }
+
+  function clamp(value, min, max) {
+    return Math.max(min, Math.min(value, max));
+  }
+
+  function coerceSize(payload) {
+    var width = typeof payload.width === 'number' ? payload.width : (payload.open ? OPEN_SIZE.width : CLOSED_SIZE.width);
+    var height = typeof payload.height === 'number' ? payload.height : (payload.open ? OPEN_SIZE.height : CLOSED_SIZE.height);
+    var vw = window.innerWidth || document.documentElement.clientWidth || width;
+    var vh = window.innerHeight || document.documentElement.clientHeight || height;
+    var pad = payload.open ? 24 : 16;
+    var maxWidth = Math.max(80, vw - pad);
+    var maxHeight = Math.max(80, vh - pad);
+    if (payload.compact) {
+      maxWidth = Math.max(72, vw - pad);
+      maxHeight = Math.max(120, vh - pad);
+    }
+    return {
+      width: clamp(width, CLOSED_SIZE.width, maxWidth),
+      height: clamp(height, CLOSED_SIZE.height, maxHeight)
+    };
+  }
+
+  function setContainerSize(payload) {
+    var S = window[WNS];
+    var container = S.elements.container;
+    if (!container) return;
+    var dims = coerceSize(payload || S.lastSize || {});
+    container.style.width = dims.width + 'px';
+    container.style.height = dims.height + 'px';
+    if (payload && typeof payload.compact === 'boolean') {
+      if (payload.compact) container.classList.add('avatar-widget-compact');
+      else container.classList.remove('avatar-widget-compact');
+    }
+  }
+
+  function ensureResizeListener() {
+    var S = window[WNS];
+    if (S.resizeListener) return;
+    S.resizeListener = function () { setContainerSize(S.lastSize); };
+    window.addEventListener('resize', S.resizeListener);
   }
 
   function buildDOM(opts) {
@@ -53,43 +98,27 @@
     ensureStyles();
 
     var container = document.createElement('div');
-    container.className = 'avatar-widget-container avatar-widget-dock avatar-widget-hidden';
-    container.setAttribute('role', 'dialog');
-    container.setAttribute('aria-label', 'Voice assistant');
+    container.className = 'avatar-widget-container';
+    container.setAttribute('role', 'complementary');
+    container.setAttribute('aria-label', 'Voice assistant dock');
 
     if (opts && opts.offset) {
       if (typeof opts.offset.right === 'number') container.style.right = opts.offset.right + 'px';
       if (typeof opts.offset.bottom === 'number') container.style.bottom = opts.offset.bottom + 'px';
     }
-    if (opts && opts.size) {
-      if (typeof opts.size.width === 'number') container.style.width = opts.size.width + 'px';
-      if (typeof opts.size.height === 'number') container.style.height = opts.size.height + 'px';
-    }
-
-    var header = document.createElement('div');
-    header.className = 'avatar-widget-header';
-    var title = document.createElement('div');
-    title.className = 'title';
-    title.textContent = 'Assistant';
-    var close = document.createElement('button');
-    close.className = 'avatar-widget-close';
-    close.title = close.setAttribute('aria-label','Close') || 'Close';
-    close.innerHTML = '&#x2715;';
-    close.addEventListener('click', function () { API.close(); });
-
-    header.appendChild(title); header.appendChild(close);
 
     var iframe = document.createElement('iframe');
     iframe.className = 'avatar-widget-iframe';
     iframe.allow = 'microphone; autoplay; clipboard-read; clipboard-write; speaker-selection';
+    iframe.title = 'Otto voice assistant';
 
-    container.appendChild(header);
     container.appendChild(iframe);
     document.body.appendChild(container);
 
-    document.addEventListener('keydown', function (e) { if (e.key === 'Escape' && !container.classList.contains('avatar-widget-hidden')) API.close(); });
-
-    S.elements.container = container; S.elements.header = header; S.elements.iframe = iframe; S.elements.closeBtn = close;
+    S.elements.container = container;
+    S.elements.iframe = iframe;
+    setContainerSize(S.lastSize);
+    ensureResizeListener();
   }
 
   function setIframeSrc() {
@@ -97,7 +126,7 @@
     if (!iframe.src) {
       S.frameReady = false;
       S.queue.length = 0;
-      iframe.src = S.origin + '/embed?layout=compact&videoFirst=1';
+      iframe.src = S.origin + '/embed';
     }
   }
 
@@ -121,54 +150,69 @@
     } catch (e) {}
   }
 
+  function handleFrameMessage(evt) {
+    var S = window[WNS];
+    var data = evt && evt.data;
+    if (!data || typeof data !== 'object') return;
+    if (S.origin && evt.origin && evt.origin !== S.origin) return;
+
+    if (data.type === 'avatar-widget:ready') {
+      S.frameReady = true;
+      flushQueue();
+      if (S.open) postToFrame('open', true);
+      emit('ready', { frame: true });
+      return;
+    }
+
+    if (data.type === 'avatar-widget:size') {
+      S.lastSize = {
+        width: typeof data.width === 'number' ? data.width : undefined,
+        height: typeof data.height === 'number' ? data.height : undefined,
+        open: !!data.open,
+        compact: !!data.compact
+      };
+      setContainerSize(S.lastSize);
+    }
+  }
+
   function bindReadyListener() {
     var S = window[WNS];
     if (S.readyListener) return;
     S.readyListener = true;
-    window.addEventListener('message', function (evt) {
-      try {
-        var data = evt && evt.data;
-        if (!data || typeof data !== 'object') return;
-        if (data.type !== 'avatar-widget:ready') return;
-        if (S.origin && evt.origin && evt.origin !== S.origin) return;
-        S.frameReady = true;
-        flushQueue();
-        if (S.open) postToFrame('open', true);
-      } catch (e) {}
-    });
+    window.addEventListener('message', handleFrameMessage);
   }
 
   function mount(opts) {
     var S = window[WNS];
     if (S.mounted) {
-      if (S.elements.container && opts) {
-        if (opts.size) { if (typeof opts.size.width==='number') S.elements.container.style.width = opts.size.width + 'px'; if (typeof opts.size.height==='number') S.elements.container.style.height = opts.size.height + 'px'; }
-        if (opts.offset) { if (typeof opts.offset.right==='number') S.elements.container.style.right = opts.offset.right + 'px'; if (typeof opts.offset.bottom==='number') S.elements.container.style.bottom = opts.offset.bottom + 'px'; }
+      if (S.elements.container && opts && opts.offset) {
+        if (typeof opts.offset.right === 'number') S.elements.container.style.right = opts.offset.right + 'px';
+        if (typeof opts.offset.bottom === 'number') S.elements.container.style.bottom = opts.offset.bottom + 'px';
       }
-      emit('ready', { updated: true }); return;
+      emit('ready', { updated: true });
+      return;
     }
     S.opts = opts || {};
     buildDOM(S.opts);
     bindReadyListener();
+    setIframeSrc();
     S.mounted = true;
     emit('ready', { mounted: true });
   }
 
   function open() {
     var S = window[WNS]; if (!S.mounted) mount({});
-    if (S.open) return;
-    var c = S.elements.container; if (!c) return;
-    c.classList.remove('avatar-widget-hidden');
     setIframeSrc();
     S.open = true;
-    emit('opened'); postToFrame('open');
+    emit('opened');
+    postToFrame('open');
   }
 
   function close() {
-    var S = window[WNS]; if (!S.mounted || !S.open) return;
-    var c = S.elements.container; if (c) c.classList.add('avatar-widget-hidden');
+    var S = window[WNS]; if (!S.mounted) return;
     S.open = false;
-    emit('closed'); postToFrame('close');
+    emit('closed');
+    postToFrame('close');
   }
 
   function gesture() {
@@ -178,6 +222,11 @@
     postToFrame('gesture');
   }
 
-  var API = { mount: mount, open: open, close: close, gesture: gesture };
+  function isOpen() {
+    var S = window[WNS];
+    return !!S.open;
+  }
+
+  var API = { mount: mount, open: open, close: close, gesture: gesture, isOpen: isOpen };
   window.AvatarWidget = API;
 })();
